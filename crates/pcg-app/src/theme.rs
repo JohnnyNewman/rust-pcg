@@ -2,6 +2,7 @@
 
 use bevy_egui::egui::{self, Color32};
 use pcg_core::{NodeKind, SummaryState};
+use pcg_syntax::Hl;
 
 pub const BG: Color32 = Color32::from_rgb(0x11, 0x12, 0x1b);
 pub const PANEL: Color32 = Color32::from_rgb(0x18, 0x19, 0x26);
@@ -45,6 +46,21 @@ pub fn summary_state(s: SummaryState) -> (Color32, &'static str) {
 }
 
 pub const INTENT: Color32 = Color32::from_rgb(0xc6, 0xa0, 0xf6);
+
+/// Syntax colours of the in-node editor.
+pub fn highlight(h: Hl) -> Color32 {
+    match h {
+        Hl::Keyword => Color32::from_rgb(0xc6, 0xa0, 0xf6),
+        Hl::Type => Color32::from_rgb(0xee, 0xd4, 0x9f),
+        Hl::Function => Color32::from_rgb(0x8a, 0xad, 0xf4),
+        Hl::Macro => Color32::from_rgb(0x8b, 0xd5, 0xca),
+        Hl::String => Color32::from_rgb(0xa6, 0xda, 0x95),
+        Hl::Number => Color32::from_rgb(0xf5, 0xa9, 0x7f),
+        Hl::Comment => TEXT_DIM,
+        Hl::Attribute => Color32::from_rgb(0xf0, 0xc6, 0xc6),
+        Hl::Lifetime => Color32::from_rgb(0xed, 0x87, 0x96),
+    }
+}
 
 pub fn apply(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();

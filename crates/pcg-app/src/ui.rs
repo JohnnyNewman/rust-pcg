@@ -162,8 +162,8 @@ pub fn ui(
                 i.key_pressed(egui::Key::Enter),
             )
         });
-        // While an editor is open, Esc belongs to it.
-        let editing_now = editing.session.is_some();
+        // Esc closes the focused editor first.
+        let editing_now = editing.docs.iter().any(|d| d.editors.iter().any(|e| e.focused));
         if !ctx.egui_wants_keyboard_input() {
             if enter && sel.selected.is_some() {
                 edit = Some(sel.selected);
@@ -184,18 +184,12 @@ pub fn ui(
         }
         // ---- in-node editor ---------------------------------------------------
         if let Some(n) = edit {
-            if editing.session.as_ref().is_some_and(|s| s.dirty) {
-                st.status = "save or discard the open editor first".into();
-            } else if editing.session.as_ref().is_some_and(|s| s.node == n) {
-                // Already editing this node.
-            } else if let Some(s) = crate::edit::open(p, n) {
-                editing.session = Some(s);
-                fly = Some(n);
-            } else {
-                st.status = "this node has no source to edit".into();
+            match crate::edit::open(&mut editing, p, n) {
+                Ok(()) => fly = Some(n),
+                Err(why) => st.status = why.into(),
             }
         }
-        crate::edit::editor(ctx, p, &view, &mut editing, &mut st, &mut req, now);
+        crate::edit::editors(ctx, p, &view, &mut editing, &mut st, &mut req, now);
 
         if let Some(n) = fly {
             view.fly_to_node(&p.layout, n);

@@ -29,5 +29,5 @@ pub mod scan;
 pub use assemble::{BuildStats, build_graph, build_graph_cached, build_graph_overlaid};
 pub use cache::{Overlays, ParseCache};
 pub use diff::{GraphDiff, diff};
-pub use edit::Buffer;
+pub use edit::{Buffer, Hl, ItemPath};
 pub use pcg_comment::{TextEdit, short_hash, summary_edit};
