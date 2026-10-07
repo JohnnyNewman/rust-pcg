@@ -5,7 +5,7 @@ use bevy::tasks::Task;
 use bevy_egui::egui;
 use pcg_core::{Graph, NodeId};
 use pcg_layout::Layout;
-use pcg_syntax::BuildStats;
+use pcg_syntax::{BuildStats, GraphDiff, ParseCache};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,44 @@ pub struct Loaded {
     pub t_layout: Duration,
     /// Per-node lowercase names for search.
     pub search_names: Vec<Box<str>>,
+    /// Diff against the snapshot this one replaced (same project only).
+    pub diff: Option<GraphDiff>,
+    pub t_diff: Duration,
+}
+
+/// The animated hand-over from one snapshot to the next. While active, the
+/// canvas tweens matched nodes from their old to their new rect, fades
+/// entered nodes in, exited ones out, and flashes changed ones.
+#[derive(Resource, Default)]
+pub struct Transition {
+    /// Previous snapshot; dropped when the transition ends (frees its memory).
+    pub prev: Option<Arc<Loaded>>,
+    pub started: f64,
+}
+
+/// Parse cache shared with the background build task. Reset when another
+/// project is opened.
+#[derive(Resource, Default)]
+pub struct Cache {
+    pub root: PathBuf,
+    pub cache: Arc<std::sync::Mutex<ParseCache>>,
+}
+
+/// File watcher. The notify callback only bumps an atomic counter (no locks,
+/// no allocation on the hot path); [`crate::watch::poll`] debounces it into a
+/// reload request.
+#[derive(Resource, Default)]
+pub struct Watch {
+    pub root: PathBuf,
+    pub watcher: Option<notify::RecommendedWatcher>,
+    pub events: Arc<std::sync::atomic::AtomicU64>,
+    /// Counter value already turned into a reload.
+    pub seen: u64,
+    /// Counter value at the last observed change (for debouncing).
+    pub burst: u64,
+    /// Last time the counter moved.
+    pub last_change: f64,
+    pub error: Option<String>,
 }
 
 #[derive(Resource, Default)]
@@ -39,6 +77,7 @@ pub struct LoadRequest {
 pub struct LoadTask {
     pub task: Option<Task<Loaded>>,
     pub keep_view: bool,
+    pub path: PathBuf,
     pub started: f64,
 }
 
@@ -73,13 +112,11 @@ pub struct Selection {
     pub hovered: NodeId,
     /// Time of the last selection change (drives the highlight animation).
     pub changed_at: f64,
-    /// After a reload, reselect by qualified name.
-    pub reselect: Option<String>,
 }
 
 impl Default for Selection {
     fn default() -> Self {
-        Self { selected: NodeId::NONE, hovered: NodeId::NONE, changed_at: 0.0, reselect: None }
+        Self { selected: NodeId::NONE, hovered: NodeId::NONE, changed_at: 0.0 }
     }
 }
 

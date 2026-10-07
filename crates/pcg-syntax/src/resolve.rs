@@ -206,13 +206,40 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
         };
     }
 
-    let mut fns: FxHashMap<Sym, Vec<NodeId>> = FxHashMap::default();
+    // Candidate indexes, one per call form, so each call site only visits
+    // functions that can match it (the old single name → fns map made common
+    // names like `new` cost O(#fns named new) per call site).
+    //   free:      name → fns directly in a module/crate        (Plain, crate::/super::/self::)
+    //   in_crate:  (crate, name) → fns in an impl/trait          (Method: same crate only)
+    //   qualified: (name, qualifier) → fns in an impl/trait/module named by the qualifier
+    let mut free: FxHashMap<Sym, Vec<NodeId>> = FxHashMap::default();
+    let mut in_crate: FxHashMap<(NodeId, Sym), Vec<NodeId>> = FxHashMap::default();
+    let mut qualified: FxHashMap<(Sym, Sym), Vec<NodeId>> = FxHashMap::default();
     let mut macros: FxHashMap<Sym, Vec<NodeId>> = FxHashMap::default();
     let mut traits: FxHashMap<Sym, Vec<NodeId>> = FxHashMap::default();
-    for i in 0..n {
+    for (i, &kind) in nodes.kind.iter().enumerate() {
         let id = NodeId::from_idx(i);
-        match nodes.kind[i] {
-            NodeKind::Fn => fns.entry(nodes.name[i]).or_default().push(id),
+        match kind {
+            NodeKind::Fn => {
+                let name = nodes.name[i];
+                let p = nodes.parent[i];
+                let pk = nodes.kind[p.idx()];
+                if pk.is_module() || pk == NodeKind::Crate {
+                    free.entry(name).or_default().push(id);
+                }
+                if matches!(pk, NodeKind::Impl | NodeKind::Trait) {
+                    in_crate.entry((crate_of[i], name)).or_default().push(id);
+                }
+                if pk == NodeKind::Impl {
+                    let (s, t) = (impl_self[p.idx()], impl_trait[p.idx()]);
+                    qualified.entry((name, s)).or_default().push(id);
+                    if t != s {
+                        qualified.entry((name, t)).or_default().push(id);
+                    }
+                } else {
+                    qualified.entry((name, nodes.name[p.idx()])).or_default().push(id);
+                }
+            }
             NodeKind::Macro => macros.entry(nodes.name[i]).or_default().push(id),
             NodeKind::Trait => traits.entry(nodes.name[i]).or_default().push(id),
             _ => {}
@@ -226,7 +253,6 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
 
     let impl_traits: rustc_hash::FxHashSet<Sym> = impl_trait.iter().copied().filter(|s| *s != Sym::EMPTY).collect();
     let std_methods: rustc_hash::FxHashSet<Sym> = STD_METHODS.iter().filter_map(|m| g.strings.get(m)).collect();
-    let parent_kind = |c: NodeId| nodes.kind[nodes.parent[c.idx()].idx()];
     let enclosing_impl = |c: NodeId| nodes.ancestors(c).find(|a| nodes.kind[a.idx()] == NodeKind::Impl);
 
     let mut acc: FxHashMap<(u32, u32, EdgeKind), u32> = FxHashMap::default();
@@ -274,7 +300,6 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
                 if form == CallForm::Method && std_methods.contains(&callee) {
                     continue;
                 }
-                let Some(c) = fns.get(&callee) else { continue };
                 let mut q = sites.qual[s];
                 if form == CallForm::Qualified && Some(q) == s_self {
                     q = enclosing_impl(caller).map_or(Sym::EMPTY, |i| impl_self[i.idx()]);
@@ -287,19 +312,14 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
                 }
                 let modq =
                     form == CallForm::Qualified && (Some(q) == s_crate || Some(q) == s_super || Some(q) == s_selfmod);
-                let mut it = c.iter().copied().filter(|&d| {
-                    let p = nodes.parent[d.idx()];
-                    let pk = parent_kind(d);
-                    match form {
-                        CallForm::Plain => pk.is_module() || pk == NodeKind::Crate,
-                        CallForm::Method => matches!(pk, NodeKind::Impl | NodeKind::Trait),
-                        _ if modq => pk.is_module() || pk == NodeKind::Crate,
-                        _ => match pk {
-                            NodeKind::Impl => impl_self[p.idx()] == q || impl_trait[p.idx()] == q,
-                            _ => nodes.name[p.idx()] == q, // trait or module named `q`
-                        },
-                    }
-                });
+                let cands = match form {
+                    CallForm::Plain => free.get(&callee),
+                    CallForm::Method => in_crate.get(&(crate_of[caller.idx()], callee)),
+                    _ if modq => free.get(&callee),
+                    _ => qualified.get(&(callee, q)),
+                };
+                let Some(c) = cands else { continue };
+                let mut it = c.iter().copied();
                 // Unqualified method calls have no type info: stay inside the caller's crate.
                 let max_tier = if form == CallForm::Method { 1 } else { 2 };
                 pick(caller, &mut it, EdgeKind::Calls, max_tier, &mut acc);

@@ -19,6 +19,8 @@ pub fn ui(
     mut sel: ResMut<Selection>,
     mut st: ResMut<UiState>,
     mut scratch: ResMut<CanvasScratch>,
+    tr: Res<Transition>,
+    watch: Res<Watch>,
     time: Res<Time>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -71,7 +73,7 @@ pub fn ui(
             }
         });
         if ui.button("⟳ Reload").clicked() {
-            reload(&mut req, &mut sel, data.as_deref());
+            reload(&mut req);
         }
         if task.task.is_some() {
             ui.horizontal(|ui| {
@@ -79,6 +81,11 @@ pub fn ui(
                 ui.label(format!("analysing… {:.1}s", now - task.started));
             });
         }
+        match (&watch.error, watch.watcher.is_some()) {
+            (Some(e), _) => ui.colored_label(theme::DIFF_EXIT, format!("not watching: {e}")),
+            (None, true) => ui.colored_label(theme::DIFF_ENTER, "watching for changes"),
+            (None, false) => ui.label(""),
+        };
         ui.label(RichText::new(&st.status).small().monospace().color(theme::TEXT_DIM));
         ui.separator();
 
@@ -122,7 +129,8 @@ pub fn ui(
     // ---- canvas ----------------------------------------------------------------
     egui::CentralPanel::no_frame().show(&mut root, |ui| {
         if let Some(p) = &data {
-            let out = canvas(ui, p, project.loaded_at, &mut view, &sel, &st, &mut scratch, now);
+            let anim = crate::anim::Anim::new(p, &tr, now);
+            let out = canvas(ui, p, anim.as_ref(), project.loaded_at, &mut view, &sel, &st, &mut scratch, now);
             sel.hovered = out.hovered;
             if let Some(c) = out.clicked {
                 select = Some(c);
@@ -173,10 +181,9 @@ pub fn ui(
     Ok(())
 }
 
-fn reload(req: &mut LoadRequest, sel: &mut Selection, data: Option<&Loaded>) {
-    if let (Some(p), true) = (data, sel.selected.is_some()) {
-        sel.reselect = Some(p.graph.qualified_name(sel.selected));
-    }
+/// Re-run the pipeline on the same project. Selection and camera carry over
+/// via the snapshot diff (see `load::poll`).
+fn reload(req: &mut LoadRequest) {
     req.pending = true;
     req.keep_view = true;
 }
@@ -317,7 +324,7 @@ fn inspector(
             match write_summary(g, n, &st.summary_draft) {
                 Ok(()) => {
                     st.status = "summary written".into();
-                    reload(req, sel, Some(p));
+                    reload(req);
                 }
                 Err(e) => st.status = format!("write failed: {e}"),
             }

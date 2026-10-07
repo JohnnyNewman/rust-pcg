@@ -115,6 +115,11 @@ pub struct NodeTable {
     pub summary: Vec<CommentId>,
     pub intent: Vec<CommentId>,
     pub summary_state: Vec<SummaryState>,
+    /// Identity that survives reloads: hash of (parent key, kind, name, ordinal
+    /// among same-kind same-name siblings). `NodeId`s are pre-order positions and
+    /// shift on every insertion; this key is what diffs, tweens, view state and
+    /// selection are matched by across snapshots. Filled by the assemble stage.
+    pub stable_key: Vec<u64>,
 }
 
 /// Everything needed to append one node.
@@ -151,6 +156,7 @@ impl NodeTable {
         self.summary.reserve(n);
         self.intent.reserve(n);
         self.summary_state.reserve(n);
+        self.stable_key.reserve(n);
     }
 
     /// Append a node as the next pre-order entry under `parent`. The caller must
@@ -170,6 +176,7 @@ impl NodeTable {
         self.summary.push(CommentId::NONE);
         self.intent.push(CommentId::NONE);
         self.summary_state.push(SummaryState::Missing);
+        self.stable_key.push(0);
         id
     }
 

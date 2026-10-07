@@ -7,6 +7,7 @@
 //! its on-screen width crosses [`CHILD_LOD`], so zooming itself animates the
 //! level-of-detail transition.
 
+use crate::anim::Anim;
 use crate::model::*;
 use crate::theme::{self, smooth};
 use bevy_egui::egui::{
@@ -34,6 +35,7 @@ pub struct CanvasOut {
 pub fn canvas(
     ui: &mut egui::Ui,
     p: &Loaded,
+    anim: Option<&Anim>,
     loaded_at: f64,
     view: &mut View,
     sel: &Selection,
@@ -95,9 +97,10 @@ pub fn canvas(
             (scratch.child_alpha[parent.idx()], scratch.rep[parent.idx()])
         };
 
-        let r = view.world_rect_to_screen(l.x[i], l.y[i], l.w[i], l.h[i]);
-        // Grow-in after load: deeper levels appear slightly later.
-        let appear = smooth(0.0, 0.45, since_load - g.nodes.depth[i] as f32 * 0.07);
+        let r = srect(view, l, anim, i as u32);
+        // Grow-in after load: deeper levels appear slightly later. Nodes that
+        // entered in a reload fade in on their own schedule.
+        let appear = smooth(0.0, 0.45, since_load - g.nodes.depth[i] as f32 * 0.07) * anim.map_or(1.0, |a| a.appear(i));
         let alpha = parent_alpha * appear;
 
         if alpha < 0.01 || !rect.intersects(r) || r.width() < MIN_PX {
@@ -117,6 +120,24 @@ pub fn canvas(
         draw_node(&painter, g, id, r, alpha, has_children, show_children, st.face, view.zoom, &mut tab);
         if tab > 0.01 {
             tabs.push((r, id, tab));
+        }
+
+        if let Some(f) = anim.map(|a| a.flash(i)).filter(|&f| f > 0.01) {
+            use pcg_syntax::diff::flag;
+            let fl = anim.map_or(0, |a| a.diff.flags[i]);
+            let entered = fl & flag::ENTERED != 0;
+            let c = if entered { theme::DIFF_ENTER } else { theme::DIFF_CHANGE };
+            // Only the changed node itself gets a fill; its ancestors just a ring,
+            // so a change deep inside does not tint the whole project.
+            if fl & (flag::CHANGED | flag::ENTERED) != 0 {
+                painter.rect_filled(r, CornerRadius::same(5), c.gamma_multiply(0.18 * f * alpha));
+            }
+            painter.rect_stroke(
+                r.expand(1.0 + 3.0 * f),
+                CornerRadius::same(6),
+                Stroke::new(1.0 + 1.5 * f, c.gamma_multiply(0.9 * f)),
+                StrokeKind::Outside,
+            );
         }
 
         if id == sel.selected {
@@ -160,9 +181,12 @@ pub fn canvas(
         painter.galley(pos + Vec2::new(5.0, 2.0), galley, theme::TEXT);
     }
 
+    if let Some(a) = anim {
+        draw_exits(&painter, a, l, view, rect);
+    }
+
     if hovered.is_some() && hovered != sel.selected {
-        let i = hovered.idx();
-        let r = view.world_rect_to_screen(l.x[i], l.y[i], l.w[i], l.h[i]);
+        let r = srect(view, l, anim, hovered.0);
         painter.rect_stroke(
             r,
             CornerRadius::same(4),
@@ -173,10 +197,10 @@ pub fn canvas(
 
     // ---- edges -----------------------------------------------------------
     if st.show_all_edges {
-        draw_overview_edges(&painter, g, l, view, scratch);
+        draw_overview_edges(&painter, g, l, anim, view, scratch);
     }
     if sel.selected.is_some() && sel.selected.idx() < n {
-        draw_focus_edges(&painter, g, l, view, scratch, sel.selected, now);
+        draw_focus_edges(&painter, g, l, anim, view, scratch, sel.selected, now);
     }
 
     // ---- tooltip -----------------------------------------------------------
@@ -368,11 +392,51 @@ fn draw_summary(painter: &Painter, g: &Graph, id: NodeId, body: Rect, line_px: f
     painter.galley(body.min + Vec2::new(0.0, line_px * 0.2), galley, color);
 }
 
-/// Screen rect of a node.
+/// Screen rect of a node (tweened while a transition runs).
 #[inline]
-fn srect(view: &View, l: &Layout, n: u32) -> Rect {
+fn srect(view: &View, l: &Layout, anim: Option<&Anim>, n: u32) -> Rect {
     let i = n as usize;
-    view.world_rect_to_screen(l.x[i], l.y[i], l.w[i], l.h[i])
+    let [x, y, w, h] = match anim {
+        Some(a) => a.rect(l, i),
+        None => [l.x[i], l.y[i], l.w[i], l.h[i]],
+    };
+    view.world_rect_to_screen(x, y, w, h)
+}
+
+/// Removed subtrees: drawn once, as their root box, fading and shrinking at
+/// their old place (carried along with the surviving parent).
+fn draw_exits(painter: &Painter, a: &Anim, l: &Layout, view: &View, clip: Rect) {
+    let e = a.exit();
+    if e >= 1.0 {
+        return;
+    }
+    let og = &a.prev.graph;
+    for &o in a.diff.exit_roots.iter().take(2000) {
+        let [x, y, w, h] = a.exit_rect(l, o);
+        let r = view.world_rect_to_screen(x, y, w, h);
+        if !clip.intersects(r) || r.width() < MIN_PX {
+            continue;
+        }
+        let r = Rect::from_center_size(r.center(), r.size() * (1.0 - 0.25 * e));
+        let alpha = 1.0 - e;
+        painter.rect(
+            r,
+            CornerRadius::same(5),
+            theme::DIFF_EXIT.gamma_multiply(0.22 * alpha),
+            Stroke::new(1.5, theme::DIFF_EXIT.gamma_multiply(0.9 * alpha)),
+            StrokeKind::Inside,
+        );
+        if r.width() > 40.0 && r.height() > 14.0 {
+            let fs = (r.height() * 0.4).clamp(8.0, 13.0);
+            painter.with_clip_rect(r.intersect(clip)).text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                og.name(o),
+                FontId::proportional(fs),
+                theme::TEXT.gamma_multiply(alpha),
+            );
+        }
+    }
 }
 
 /// Bezier from the right side of `a` to the left side of `b` (or around, when
@@ -395,10 +459,12 @@ fn bez_point(p: &[Pos2; 4], t: f32) -> Pos2 {
 
 /// Edges in/out of the selection (and its descendants), with flowing dots
 /// showing direction — a preview of the M5 particle encoding.
+#[allow(clippy::too_many_arguments)]
 fn draw_focus_edges(
     painter: &Painter,
     g: &Graph,
     l: &Layout,
+    anim: Option<&Anim>,
     view: &View,
     scratch: &CanvasScratch,
     sel: NodeId,
@@ -425,7 +491,7 @@ fn draw_focus_edges(
                     (_, true) => theme::EDGE_OUT,
                     (_, false) => theme::EDGE_IN,
                 };
-                let pts = curve(srect(view, l, rs), srect(view, l, rd));
+                let pts = curve(srect(view, l, anim, rs), srect(view, l, anim, rd));
                 let w = 1.2 + (g.edges.weight[e.idx()] as f32).log2().max(0.0) * 0.6;
                 painter.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
                     pts,
@@ -451,7 +517,14 @@ fn draw_focus_edges(
 }
 
 /// All edges, aggregated onto the currently drawn boxes (deduplicated).
-fn draw_overview_edges(painter: &Painter, g: &Graph, l: &Layout, view: &View, scratch: &mut CanvasScratch) {
+fn draw_overview_edges(
+    painter: &Painter,
+    g: &Graph,
+    l: &Layout,
+    anim: Option<&Anim>,
+    view: &View,
+    scratch: &mut CanvasScratch,
+) {
     scratch.edge_pairs.clear();
     let stroke = Stroke::new(1.0, theme::EDGE_OUT.gamma_multiply(0.18));
     for e in 0..g.edges.len() {
@@ -459,7 +532,7 @@ fn draw_overview_edges(painter: &Painter, g: &Graph, l: &Layout, view: &View, sc
         if rs == u32::MAX || rd == u32::MAX || rs == rd || !scratch.edge_pairs.insert((rs, rd)) {
             continue;
         }
-        let (a, b) = (srect(view, l, rs), srect(view, l, rd));
+        let (a, b) = (srect(view, l, anim, rs), srect(view, l, anim, rd));
         painter.line_segment([Pos2::new(a.max.x, a.center().y), Pos2::new(b.min.x, b.center().y)], stroke);
         if scratch.edge_pairs.len() >= MAX_OVERVIEW_EDGES {
             break;

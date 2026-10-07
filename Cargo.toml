@@ -16,6 +16,7 @@ rustc-hash = "2"
 rayon = "1.12"
 walkdir = "2.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+notify = "8"
 tree-sitter = "0.27"
 tree-sitter-rust = "0.24"
 # No gamepad (gilrs/udev) or audio: an IDE does not need them.

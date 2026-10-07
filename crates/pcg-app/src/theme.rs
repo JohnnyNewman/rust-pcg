@@ -10,6 +10,10 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x80, 0x87, 0xa2);
 pub const ACCENT: Color32 = Color32::from_rgb(0xf4, 0xdb, 0xd6);
 pub const EDGE_OUT: Color32 = Color32::from_rgb(0x8a, 0xad, 0xf4);
 pub const EDGE_IN: Color32 = Color32::from_rgb(0xf5, 0xa9, 0x7f);
+/// Graph-diff animation colours.
+pub const DIFF_ENTER: Color32 = Color32::from_rgb(0xa6, 0xda, 0x95);
+pub const DIFF_CHANGE: Color32 = Color32::from_rgb(0xee, 0xd4, 0x9f);
+pub const DIFF_EXIT: Color32 = Color32::from_rgb(0xed, 0x87, 0x96);
 pub const GRID: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x3d);
 
 pub fn bevy_clear() -> bevy::color::Color {

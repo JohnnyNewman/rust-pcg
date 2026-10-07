@@ -7,17 +7,21 @@
 //!
 //! | system            | schedule               | reads → writes                          |
 //! |-------------------|------------------------|-----------------------------------------|
-//! | `load::start`     | Update                 | `LoadRequest` → `LoadTask`              |
-//! | `load::poll`      | Update                 | `LoadTask` → `Project`, `View`          |
+//! | `watch::poll`     | Update                 | `Watch` → `LoadRequest` (debounced)     |
+//! | `load::start`     | Update                 | `LoadRequest`, `Cache` → `LoadTask`     |
+//! | `load::poll`      | Update                 | `LoadTask` → `Project`, `Transition`, `View`, `Selection`, `Watch` |
+//! | `anim::end`       | Update                 | `Time` → `Transition` (drops old snapshot) |
 //! | `view::animate`   | Update                 | `Time` → `View`                         |
 //! | `ui::ui`          | EguiPrimaryContextPass | everything → `View`, `Selection`, `UiState`, `LoadRequest` |
 
+mod anim;
 mod canvas;
 mod load;
 mod model;
 mod theme;
 mod ui;
 mod view;
+mod watch;
 
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
@@ -44,8 +48,11 @@ fn main() {
         .init_resource::<View>()
         .init_resource::<Selection>()
         .init_resource::<CanvasScratch>()
+        .init_resource::<Transition>()
+        .init_resource::<Cache>()
+        .init_resource::<Watch>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (load::start, load::poll, view::animate).chain())
+        .add_systems(Update, (watch::poll, load::start, load::poll, anim::end, view::animate).chain())
         .add_systems(EguiPrimaryContextPass, ui::ui)
         .run();
 }

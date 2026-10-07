@@ -34,6 +34,7 @@ On Windows the MSVC toolchain is required (tree-sitter compiles C code).
 | *code face / summary face* | what leaves show at deep zoom |
 | *all edges* | aggregated call graph on the visible boxes |
 | inspector → *Accept & write summary* | writes a `@pcg:summary[h=…]` comment into the file (only on this explicit accept, decision 7) and reloads |
+| *(save a file in any editor)* | the project is watched: only changed files are re-parsed, and the graph animates the diff — moved boxes glide, new ones fade in (green), removed ones fade out (red), changed ones glow (yellow). Selection follows the node by identity. |
 
 ## Workspace
 
@@ -90,14 +91,19 @@ draws only ~1–5 k boxes per frame.
 
 ![200 MB of crates, 869k nodes](docs/screenshots/registry-869k-nodes.png)
 
-## Known limitations (M1)
+![reload diff: exits fade out, modules make room, new fns fade in](docs/screenshots/diff-animation.png)
+
+## Known limitations
 
 * **Call edges are name-based heuristics** (free fn / method / `Type::f` / macro, ranked
   same-file → same-crate → global, ambiguous calls dropped, common std method names
   skipped, unqualified method calls stay inside the crate). Precise resolution = LSP (M6).
   Calls inside macro arguments (`println!(…f()…)`) are not seen by tree-sitter.
-* Syntax trees are dropped after extraction (memory); incremental reparse arrives with
-  file watching in M2.
+* Syntax trees are dropped after extraction (memory). Reloads are incremental per *file*
+  (a parse cache keyed by mtime/size/bytes), not per edit: an external save gives no
+  edit ranges for tree-sitter. Edit-range reparse comes with in-node editing (M3).
+* Stable node identity is `(parent, kind, name, ordinal)`: renaming an item, or moving
+  it to another module, reads as exit + enter, not as a move.
 * Layout is a simple shelf-packing of nested boxes; edges are drawn as beziers between
   the currently visible representatives. Real hierarchical layout + edge routing = M2.
 * Rendering uses egui's painter; GPU instancing / custom WGSL comes with M2/M5.

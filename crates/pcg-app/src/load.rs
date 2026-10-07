@@ -1,61 +1,105 @@
-//! Background loading: the whole static pipeline runs on the async compute pool
-//! and hands back an immutable [`Loaded`] snapshot.
+//! Background loading: the static pipeline runs on the async compute pool and
+//! hands back an immutable [`Loaded`] snapshot. Reloads of the same project
+//! reuse the [`Cache`] (only changed files are re-parsed) and carry a diff
+//! against the previous snapshot, which drives the [`Transition`].
 
 use crate::model::*;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, futures::check_ready};
 use pcg_core::NodeId;
-use std::sync::Arc;
+use pcg_syntax::ParseCache;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub fn build(path: std::path::PathBuf) -> Loaded {
-    let (graph, stats) = pcg_syntax::build_graph(&path);
+pub fn build(path: std::path::PathBuf, cache: Arc<Mutex<ParseCache>>, prev: Option<Arc<Loaded>>) -> Loaded {
+    let (graph, stats) = {
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        pcg_syntax::build_graph_cached(&path, &mut c)
+    };
     let t = Instant::now();
     let name_len: Vec<u32> =
         (0..graph.nodes.len()).map(|i| graph.name(NodeId::from_idx(i)).chars().count() as u32).collect();
     let layout = pcg_layout::layout(&graph.nodes, &name_len, &Default::default());
     let t_layout = t.elapsed();
     let search_names = (0..graph.nodes.len()).map(|i| graph.name(NodeId::from_idx(i)).to_lowercase().into()).collect();
-    Loaded { graph, layout, stats, t_layout, search_names }
+    let t = Instant::now();
+    let diff = prev.map(|p| pcg_syntax::diff(&p.graph.nodes, &graph.nodes));
+    let t_diff = t.elapsed();
+    Loaded { graph, layout, stats, t_layout, search_names, diff, t_diff }
 }
 
-pub fn start(mut req: ResMut<LoadRequest>, mut task: ResMut<LoadTask>, time: Res<Time>) {
+pub fn start(
+    mut req: ResMut<LoadRequest>,
+    mut task: ResMut<LoadTask>,
+    mut cache: ResMut<Cache>,
+    project: Res<Project>,
+    time: Res<Time>,
+) {
     if !req.pending || task.task.is_some() {
         return;
     }
     req.pending = false;
     let path = req.path.clone();
-    task.keep_view = req.keep_view;
+    // A different project gets a fresh cache and no diff.
+    let same_project = cache.root == path && project.data.is_some();
+    if !same_project {
+        *cache = Cache { root: path.clone(), ..default() };
+    }
+    let prev = if same_project { project.data.clone() } else { None };
+    let c = cache.cache.clone();
+    task.keep_view = req.keep_view && same_project;
+    task.path = path.clone();
     task.started = time.elapsed_secs_f64();
-    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path) }));
+    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path, c, prev) }));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn poll(
     mut task: ResMut<LoadTask>,
     mut project: ResMut<Project>,
     mut view: ResMut<View>,
     mut sel: ResMut<Selection>,
     mut ui: ResMut<UiState>,
+    mut tr: ResMut<Transition>,
+    mut watch: ResMut<Watch>,
     time: Res<Time>,
 ) {
     let Some(t) = task.task.as_mut() else { return };
     let Some(loaded) = check_ready(t) else { return };
     task.task = None;
     let now = time.elapsed_secs_f64();
-    ui.status = format!("{}\nlayout {:.1} ms", loaded.stats, loaded.t_layout.as_secs_f64() * 1e3);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    ui.status = format!("{}\nlayout {:.1} ms", loaded.stats, ms(loaded.t_layout));
+    if let Some(d) = &loaded.diff {
+        ui.status += &format!(" | diff {:.1} ms: +{} −{} ~{}", ms(loaded.t_diff), d.entered, d.exited, d.changed);
+    }
     info!("{}", ui.status);
 
-    let g = &loaded.graph;
-    sel.hovered = NodeId::NONE;
-    sel.selected = NodeId::NONE;
-    if let Some(q) = sel.reselect.take() {
-        sel.selected =
-            (0..g.nodes.len()).map(NodeId::from_idx).find(|&n| g.qualified_name(n) == q).unwrap_or(NodeId::NONE);
+    // Carry selection over by identity, not by position.
+    let map = |n: NodeId| match &loaded.diff {
+        Some(d) if n.is_some() && n.idx() < d.new_of_old.len() => d.new_of_old[n.idx()],
+        _ => NodeId::NONE,
+    };
+    let selected = map(sel.selected);
+    if selected != sel.selected {
+        sel.changed_at = now;
     }
+    sel.selected = selected;
+    sel.hovered = NodeId::NONE;
     ui.search_for.clear(); // invalidate search hits (ids changed)
-    if !task.keep_view {
+
+    if task.keep_view {
+        // Animate only if something actually changed.
+        let changed = loaded.diff.as_ref().is_some_and(|d| !d.is_empty());
+        tr.prev = if changed { project.data.take() } else { None };
+        tr.started = now;
+    } else {
+        tr.prev = None;
         view.needs_fit = true;
         project.loaded_at = now;
+    }
+    if watch.root != task.path {
+        crate::watch::watch(&mut watch, &task.path);
     }
     project.data = Some(Arc::new(loaded));
 }

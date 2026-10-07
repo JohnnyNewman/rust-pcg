@@ -1,6 +1,7 @@
 //! Serial assembly: file-local parse results → global pre-order tables.
 
-use crate::parse::{CalleeForm, FileSyntax, LOCAL_NONE, parse_file};
+use crate::cache::{Fetch, ParseCache, fetch};
+use crate::parse::{CalleeForm, LOCAL_NONE};
 use crate::pcg_comment::short_hash;
 use crate::resolve::{CallForm, CallSites, resolve_edges};
 use crate::scan::scan;
@@ -19,6 +20,8 @@ pub struct BuildStats {
     pub edges: usize,
     pub comments: usize,
     pub files_with_parse_errors: usize,
+    /// Files actually parsed this build (the rest came from the [`ParseCache`]).
+    pub files_parsed: usize,
     pub t_scan: Duration,
     pub t_parse: Duration,
     pub t_assemble: Duration,
@@ -31,9 +34,10 @@ impl std::fmt::Display for BuildStats {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         write!(
             f,
-            "{} files, {:.1} MB, {} lines → {} nodes, {} edges, {} @pcg comments ({} files with parse errors)\n\
+            "{} files ({} parsed), {:.1} MB, {} lines → {} nodes, {} edges, {} @pcg comments ({} files with parse errors)\n\
              scan {:.1} ms | parse {:.1} ms | assemble {:.1} ms | resolve {:.1} ms | total {:.1} ms ({:.0} MB/s)",
             self.files,
+            self.files_parsed,
             self.bytes as f64 / 1e6,
             self.lines,
             self.nodes,
@@ -54,26 +58,35 @@ fn synthetic(kind: NodeKind, name: Sym) -> NewNode {
     NewNode { kind, name, file: FileId::NONE, bytes: Span::default(), lines: Span::default(), content_hash: 0 }
 }
 
-/// Run the full static pipeline on a directory.
+/// Run the full static pipeline on a directory, parsing every file.
 pub fn build_graph(root: &Path) -> (Graph, BuildStats) {
+    build_graph_cached(root, &mut ParseCache::default())
+}
+
+/// Run the full static pipeline, re-parsing only files whose text changed
+/// since `cache` was filled. Updates `cache` (and evicts deleted files).
+pub fn build_graph_cached(root: &Path, cache: &mut ParseCache) -> (Graph, BuildStats) {
     let t0 = Instant::now();
+    let wall0 = std::time::SystemTime::now();
     let mut st = BuildStats::default();
 
     // --- scan -------------------------------------------------------------
     let sc = scan(root);
     st.t_scan = t0.elapsed();
 
-    // --- parse (parallel) -------------------------------------------------
+    // --- parse (parallel, cached) ----------------------------------------
     let t = Instant::now();
-    let parsed: Vec<Option<(Arc<str>, FileSyntax)>> = sc
-        .files
-        .par_iter()
-        .map(|f| {
-            let src: Arc<str> = std::fs::read_to_string(&f.path).ok()?.into();
-            let syn = parse_file(&src);
-            Some((src, syn))
-        })
-        .collect();
+    let fetched: Vec<_> = sc.files.par_iter().map(|f| fetch(cache, &f.path)).collect();
+    st.files_parsed = fetched.iter().flatten().filter(|(_, how)| *how == Fetch::Parsed).count();
+    cache.files.clear();
+    for (f, r) in sc.files.iter().zip(&fetched) {
+        if let Some((c, _)) = r {
+            cache.files.insert(f.path.clone(), c.clone());
+        }
+    }
+    cache.built_at = Some(wall0);
+    let parsed: Vec<Option<(Arc<str>, Arc<crate::parse::FileSyntax>)>> =
+        fetched.into_iter().map(|r| r.map(|(c, _)| (c.src, c.syn))).collect();
     st.t_parse = t.elapsed();
 
     // --- assemble (serial) ------------------------------------------------
@@ -199,6 +212,7 @@ pub fn build_graph(root: &Path) -> (Graph, BuildStats) {
     }
     g.nodes.close(ws);
     drop(parsed);
+    stable_keys(&mut g);
 
     // Summary freshness.
     for n in 0..g.nodes.len() {
@@ -224,4 +238,28 @@ pub fn build_graph(root: &Path) -> (Graph, BuildStats) {
     st.comments = g.comments.len();
     st.t_total = t0.elapsed();
     (g, st)
+}
+
+/// Fill [`NodeTable::stable_key`]: `xxh3(parent key, kind, name, ordinal)`,
+/// where the ordinal counts earlier siblings with the same kind and name
+/// (e.g. several `impl Foo` blocks). One linear pre-order pass.
+pub fn stable_keys(g: &mut Graph) {
+    use xxhash_rust::xxh3::xxh3_64;
+    let n = g.nodes.len();
+    let mut occ: rustc_hash::FxHashMap<(u64, u8, u64), u32> = Default::default();
+    occ.reserve(n);
+    for i in 0..n {
+        let p = g.nodes.parent[i];
+        let pk = if p.is_none() { 0 } else { g.nodes.stable_key[p.idx()] };
+        let kind = g.nodes.kind[i] as u8;
+        let nh = xxh3_64(g.strings.resolve(g.nodes.name[i]).as_bytes());
+        let o = occ.entry((pk, kind, nh)).or_insert(0);
+        let mut buf = [0u8; 21];
+        buf[..8].copy_from_slice(&pk.to_le_bytes());
+        buf[8] = kind;
+        buf[9..17].copy_from_slice(&nh.to_le_bytes());
+        buf[17..].copy_from_slice(&o.to_le_bytes());
+        *o += 1;
+        g.nodes.stable_key[i] = xxh3_64(&buf);
+    }
 }
