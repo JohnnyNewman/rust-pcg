@@ -1,4 +1,8 @@
-//! Name-based edge resolution (heuristic until LSP integration, M6).
+//! Edge resolution: call sites → weighted edges.
+//!
+//! A call site the language server has answered ([`Precise`]) is taken at its
+//! word: one edge to the definition, or none if that lies outside the
+//! workspace. Every other site is resolved by name:
 //!
 //! For each call site, candidates are definitions with the callee's name,
 //! filtered by call form (free fn / method / `Qual::f` / macro), then ranked
@@ -9,6 +13,71 @@
 
 use pcg_core::*;
 use rustc_hash::FxHashMap;
+use std::path::PathBuf;
+
+/// Call targets as answered by a language server, valid for specific file
+/// texts. Applied by the build to every call site whose file — and whose
+/// target's file — still has exactly that text.
+#[derive(Default, Debug, Clone)]
+pub struct Precise {
+    /// Hash ([`text_hash`]) of each file's text the answers were computed for.
+    pub files: FxHashMap<PathBuf, u64>,
+    /// Per file: call site (byte offset of the callee's name) → definition
+    /// (file, byte offset), or `None` if it is defined outside the workspace.
+    pub sites: FxHashMap<PathBuf, FxHashMap<u32, Option<(PathBuf, u32)>>>,
+}
+
+pub fn text_hash(text: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(text.as_bytes())
+}
+
+/// The innermost node of `file` whose bytes contain `at`.
+pub fn node_at(g: &Graph, file: FileId, at: u32) -> NodeId {
+    let m = g.files.module[file.idx()];
+    let mut best = m;
+    for n in m.0 + 1..g.nodes.subtree_end[m.idx()].0 {
+        let i = n as usize;
+        // Pre-order: a later match is nested in (or equal to) the earlier one.
+        if g.nodes.file[i] == file && g.nodes.bytes[i].start <= at && at < g.nodes.bytes[i].end {
+            best = NodeId(n);
+        }
+    }
+    best
+}
+
+/// Fill `g.calls.resolution` / `target` from the language server's answers.
+fn apply_precise(g: &mut Graph, precise: &Precise) {
+    if precise.sites.is_empty() {
+        return;
+    }
+    // Files whose text is the one the answers were computed for.
+    let current: FxHashMap<&PathBuf, FileId> = (0..g.files.len())
+        .filter(|&f| precise.files.get(&g.files.path[f]) == Some(&text_hash(&g.files.source[f])))
+        .map(|f| (&g.files.path[f], FileId::from_idx(f)))
+        .collect();
+    for s in 0..g.calls.len() {
+        let caller = g.calls.caller[s];
+        let file = g.nodes.file[caller.idx()];
+        let path = &g.files.path[file.idx()];
+        if !current.contains_key(path) {
+            continue;
+        }
+        let Some(answer) = precise.sites.get(path).and_then(|m| m.get(&g.calls.at[s])) else { continue };
+        let target = match answer {
+            None => NodeId::NONE,
+            Some((tpath, at)) => {
+                let Some(&tf) = current.get(tpath) else { continue };
+                let t = node_at(g, tf, *at);
+                // A definition inside the calling function's body is a local
+                // (closure, nested item the graph does not show): no edge.
+                let body = &g.files.source[tf.idx()][g.nodes.bytes[t.idx()].start as usize..*at as usize];
+                if t == caller && body.contains('{') { NodeId::NONE } else { t }
+            }
+        };
+        g.calls.resolution[s] = Resolution::Precise;
+        g.calls.target[s] = target;
+    }
+}
 
 pub const MAX_FANOUT: usize = 4;
 
@@ -165,32 +234,40 @@ pub enum CallForm {
     Macro,
 }
 
-/// SoA list of call sites with global caller ids.
+/// What the name-based resolution needs to know about each call site
+/// (parallel to `Graph::calls`).
 #[derive(Default, Debug)]
 pub struct CallSites {
-    pub caller: Vec<NodeId>,
     pub callee: Vec<Sym>,
     pub form: Vec<CallForm>,
     pub qual: Vec<Sym>,
 }
 
 impl CallSites {
-    pub fn push(&mut self, caller: NodeId, callee: Sym, form: CallForm, qual: Sym) {
-        self.caller.push(caller);
+    pub fn push(&mut self, callee: Sym, form: CallForm, qual: Sym) {
         self.callee.push(callee);
         self.form.push(form);
         self.qual.push(qual);
     }
     pub fn len(&self) -> usize {
-        self.caller.len()
+        self.callee.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.caller.is_empty()
+        self.callee.is_empty()
     }
 }
 
 /// Resolve calls and trait impls into `g.edges`, then build adjacency.
-pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_trait: &[Sym]) {
+pub fn resolve_edges(
+    g: &mut Graph,
+    sites: &CallSites,
+    impl_self: &[Sym],
+    impl_trait: &[Sym],
+    precise: Option<&Precise>,
+) {
+    if let Some(p) = precise {
+        apply_precise(g, p);
+    }
     let nodes = &g.nodes;
     let n = nodes.len();
 
@@ -258,12 +335,13 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
     let mut acc: FxHashMap<(u32, u32, EdgeKind), u32> = FxHashMap::default();
     let mut tier: [Vec<NodeId>; 3] = Default::default();
 
-    // `max_tier`: 2 = anywhere, 1 = same crate at most.
+    // `max_tier`: 2 = anywhere, 1 = same crate at most. Returns whether an edge was made.
     let mut pick = |src: NodeId,
                     cands: &mut dyn Iterator<Item = NodeId>,
                     kind: EdgeKind,
                     max_tier: usize,
-                    acc: &mut FxHashMap<_, u32>| {
+                    acc: &mut FxHashMap<_, u32>|
+     -> bool {
         for t in tier.iter_mut() {
             t.clear();
         }
@@ -284,16 +362,28 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
             for &d in best {
                 *acc.entry((src.0, d.0, kind)).or_default() += 1;
             }
+            return true;
         }
+        false
     };
 
+    let mut resolution = std::mem::take(&mut g.calls.resolution);
+    #[allow(clippy::needless_range_loop)] // `s` indexes four parallel tables
     for s in 0..sites.len() {
-        let caller = sites.caller[s];
+        let caller = g.calls.caller[s];
         let callee = sites.callee[s];
+        if resolution[s] == Resolution::Precise {
+            let t = g.calls.target[s];
+            if t.is_some() {
+                *acc.entry((caller.0, t.0, EdgeKind::Calls)).or_default() += 1;
+            }
+            continue;
+        }
+        let mut found = false;
         match sites.form[s] {
             CallForm::Macro => {
                 if let Some(c) = macros.get(&callee) {
-                    pick(caller, &mut c.iter().copied(), EdgeKind::Calls, 2, &mut acc);
+                    found = pick(caller, &mut c.iter().copied(), EdgeKind::Calls, 2, &mut acc);
                 }
             }
             form => {
@@ -322,8 +412,11 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
                 let mut it = c.iter().copied();
                 // Unqualified method calls have no type info: stay inside the caller's crate.
                 let max_tier = if form == CallForm::Method { 1 } else { 2 };
-                pick(caller, &mut it, EdgeKind::Calls, max_tier, &mut acc);
+                found = pick(caller, &mut it, EdgeKind::Calls, max_tier, &mut acc);
             }
+        }
+        if found {
+            resolution[s] = Resolution::Heuristic;
         }
     }
 
@@ -344,4 +437,5 @@ pub fn resolve_edges(g: &mut Graph, sites: &CallSites, impl_self: &[Sym], impl_t
         g.edges.push(NodeId(s), NodeId(d), k, w);
     }
     g.edges.build_adjacency(n);
+    g.calls.resolution = resolution;
 }

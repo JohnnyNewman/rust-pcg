@@ -22,6 +22,7 @@ pub fn ui(
     tr: Res<Transition>,
     watch: Res<Watch>,
     mut editing: ResMut<Editing>,
+    lsp: Res<Lsp>,
     time: Res<Time>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -91,6 +92,26 @@ pub fn ui(
             (None, false) => ui.label(""),
         };
         ui.label(RichText::new(&st.status).small().monospace().color(theme::TEXT_DIM));
+        // Where the call edges come from.
+        if let Some(p) = &data {
+            let (precise, calls) = (p.stats.calls_precise, p.stats.calls);
+            let edges = if !lsp.enabled {
+                "name-based (--no-lsp)".to_string()
+            } else if precise > 0 {
+                format!("{precise} of {calls} call sites resolved by rust-analyzer")
+            } else {
+                "name-based so far".to_string()
+            };
+            ui.label(RichText::new(format!("edges: {edges}")).small().color(theme::TEXT_DIM));
+            if !lsp.status.is_empty() {
+                ui.horizontal(|ui| {
+                    if lsp.busy || !lsp.failed {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&lsp.status).small().color(theme::TEXT_DIM));
+                });
+            }
+        }
         ui.separator();
 
         ui.heading("Search");

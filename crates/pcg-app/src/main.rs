@@ -9,7 +9,8 @@
 //! |-------------------|------------------------|-----------------------------------------|
 //! | `watch::poll`     | Update                 | `Watch` → `LoadRequest` (debounced)     |
 //! | `edit::poll`      | Update                 | `Editing` → `LoadRequest` (debounced live rebuild) |
-//! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay) → `LoadTask` |
+//! | `lsp::drive`      | Update                 | `Project`, worker thread ⇄ `Lsp` → `LoadRequest` (answers arrived) |
+//! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay), `Lsp` (answers) → `LoadTask` |
 //! | `load::poll`      | Update                 | `LoadTask` → `Project`, `Transition`, `View`, `Selection`, `Watch`, `Editing` |
 //! | `anim::end`       | Update                 | `Time` → `Transition` (drops old snapshot) |
 //! | `view::animate`   | Update                 | `Time` → `View`                         |
@@ -19,6 +20,7 @@ mod anim;
 mod canvas;
 mod edit;
 mod load;
+mod lsp;
 mod model;
 mod theme;
 mod ui;
@@ -30,7 +32,10 @@ use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 use model::*;
 
 fn main() {
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
+    // `pcg [--no-lsp] [path]`
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let no_lsp = args.iter().any(|a| a == "--no-lsp");
+    let path: std::path::PathBuf = args.iter().find(|a| !a.starts_with("--")).map_or_else(|| ".".into(), Into::into);
 
     App::new()
         .insert_resource(ClearColor(theme::bevy_clear()))
@@ -54,8 +59,12 @@ fn main() {
         .init_resource::<Cache>()
         .init_resource::<Watch>()
         .init_resource::<Editing>()
+        .insert_resource(Lsp { enabled: !no_lsp, ..default() })
         .add_systems(Startup, setup)
-        .add_systems(Update, (watch::poll, edit::poll, load::start, load::poll, anim::end, view::animate).chain())
+        .add_systems(
+            Update,
+            (watch::poll, edit::poll, lsp::drive, load::start, load::poll, anim::end, view::animate).chain(),
+        )
         .add_systems(EguiPrimaryContextPass, ui::ui)
         .run();
 }

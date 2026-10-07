@@ -47,6 +47,9 @@ pub struct LocalCall {
     pub caller: u32,
     pub callee: String,
     pub form: CalleeForm,
+    /// Byte offset of the callee's name (where a language server is asked
+    /// for the definition).
+    pub at: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -332,11 +335,16 @@ impl<'s> Cx<'s> {
                 "macro_invocation" => {
                     if let Some(m) = n.child_by_field_name("macro") {
                         let name = match m.kind() {
-                            "scoped_identifier" => m.child_by_field_name("name").map(|x| text(x, self.src)),
-                            _ => Some(text(m, self.src)),
+                            "scoped_identifier" => m.child_by_field_name("name"),
+                            _ => Some(m),
                         };
                         if let Some(name) = name {
-                            self.calls.push(LocalCall { caller, callee: name.to_string(), form: CalleeForm::Macro });
+                            self.calls.push(LocalCall {
+                                caller,
+                                callee: text(name, self.src).to_string(),
+                                form: CalleeForm::Macro,
+                                at: name.start_byte() as u32,
+                            });
                         }
                     }
                 }
@@ -361,8 +369,8 @@ impl<'s> Cx<'s> {
 
     fn call_target(&mut self, f: Node, caller: u32) {
         let src = self.src;
-        let (callee, form) = match f.kind() {
-            "identifier" => (text(f, src).to_string(), CalleeForm::Plain),
+        let (name, form) = match f.kind() {
+            "identifier" => (f, CalleeForm::Plain),
             "scoped_identifier" => {
                 let Some(name) = f.child_by_field_name("name") else { return };
                 let q = f
@@ -375,11 +383,11 @@ impl<'s> Cx<'s> {
                         _ => text(p, src).to_string(),
                     })
                     .unwrap_or_default();
-                (text(name, src).to_string(), CalleeForm::Qualified(q))
+                (name, CalleeForm::Qualified(q))
             }
             "field_expression" => {
                 let Some(field) = f.child_by_field_name("field") else { return };
-                (text(field, src).to_string(), CalleeForm::Method)
+                (field, CalleeForm::Method)
             }
             "generic_function" => {
                 if let Some(inner) = f.child_by_field_name("function") {
@@ -389,7 +397,7 @@ impl<'s> Cx<'s> {
             }
             _ => return,
         };
-        self.calls.push(LocalCall { caller, callee, form });
+        self.calls.push(LocalCall { caller, callee: text(name, src).to_string(), form, at: name.start_byte() as u32 });
     }
 }
 
@@ -456,6 +464,10 @@ mod inner {
         assert!(c.contains(&(1, "get", CalleeForm::Method)));
         assert!(c.contains(&(5, "println", CalleeForm::Macro)));
         assert!(c.contains(&(9, "helper", CalleeForm::Qualified("super".into()))));
+        // `at` points at the callee's name, whatever the call form.
+        for call in &fs.calls {
+            assert!(SRC[call.at as usize..].starts_with(&call.callee), "{call:?}");
+        }
     }
 
     #[test]

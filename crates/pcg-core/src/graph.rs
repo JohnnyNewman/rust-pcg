@@ -394,6 +394,45 @@ impl CommentTable {
 }
 
 // ---------------------------------------------------------------------------
+// Call sites
+// ---------------------------------------------------------------------------
+
+/// How a call site's target was determined.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum Resolution {
+    /// Not resolved (unknown name, ambiguous, or deliberately skipped).
+    #[default]
+    None,
+    /// Matched by name (may be wrong, may have several targets).
+    Heuristic,
+    /// Answered by the language server: `target`, or outside the workspace.
+    Precise,
+}
+
+/// Every call site (calls, method calls, macro invocations), SoA. The edges
+/// are an aggregation of these.
+#[derive(Default, Debug)]
+pub struct CallTable {
+    /// Innermost item containing the call.
+    pub caller: Vec<NodeId>,
+    /// Byte offset of the callee's name in the caller's file.
+    pub at: Vec<u32>,
+    pub resolution: Vec<Resolution>,
+    /// The definition, for [`Resolution::Precise`] sites inside the workspace.
+    pub target: Vec<NodeId>,
+}
+
+impl CallTable {
+    pub fn len(&self) -> usize {
+        self.caller.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.caller.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The whole graph
 // ---------------------------------------------------------------------------
 
@@ -404,6 +443,7 @@ pub struct Graph {
     pub strings: Interner,
     pub nodes: NodeTable,
     pub edges: EdgeTable,
+    pub calls: CallTable,
     pub files: FileTable,
     pub comments: CommentTable,
 }

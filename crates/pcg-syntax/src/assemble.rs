@@ -3,7 +3,7 @@
 use crate::cache::{Fetch, Overlays, ParseCache, fetch};
 use crate::parse::{CalleeForm, LOCAL_NONE};
 use crate::pcg_comment::short_hash;
-use crate::resolve::{CallForm, CallSites, resolve_edges};
+use crate::resolve::{CallForm, CallSites, Precise, resolve_edges};
 use crate::scan::scan;
 use pcg_core::*;
 use rayon::prelude::*;
@@ -18,6 +18,9 @@ pub struct BuildStats {
     pub lines: usize,
     pub nodes: usize,
     pub edges: usize,
+    /// Call sites, and how many of them the language server answered.
+    pub calls: usize,
+    pub calls_precise: usize,
     pub comments: usize,
     pub files_with_parse_errors: usize,
     /// Files actually parsed this build (the rest came from the [`ParseCache`]).
@@ -72,6 +75,17 @@ pub fn build_graph_cached(root: &Path, cache: &mut ParseCache) -> (Graph, BuildS
 /// [`build_graph_cached`], with unsaved editor buffers taking the place of
 /// their files' on-disk text.
 pub fn build_graph_overlaid(root: &Path, cache: &mut ParseCache, overlays: &Overlays) -> (Graph, BuildStats) {
+    build_graph_with(root, cache, overlays, None)
+}
+
+/// [`build_graph_overlaid`], taking the language server's answers ([`Precise`])
+/// over the name-based guess wherever they still apply.
+pub fn build_graph_with(
+    root: &Path,
+    cache: &mut ParseCache,
+    overlays: &Overlays,
+    precise: Option<&Precise>,
+) -> (Graph, BuildStats) {
     let t0 = Instant::now();
     let wall0 = std::time::SystemTime::now();
     let mut st = BuildStats::default();
@@ -209,7 +223,9 @@ pub fn build_graph_overlaid(root: &Path, cache: &mut ParseCache, overlays: &Over
                     CalleeForm::Macro => (CallForm::Macro, Sym::EMPTY),
                     CalleeForm::Qualified(q) => (CallForm::Qualified, g.strings.intern(q)),
                 };
-                sites.push(NodeId(base + c.caller), callee, form, qual);
+                sites.push(callee, form, qual);
+                g.calls.caller.push(NodeId(base + c.caller));
+                g.calls.at.push(c.at);
             }
         }
         while let Some((_, n)) = stack.pop() {
@@ -235,12 +251,16 @@ pub fn build_graph_overlaid(root: &Path, cache: &mut ParseCache, overlays: &Over
 
     // --- resolve ----------------------------------------------------------
     let t = Instant::now();
-    resolve_edges(&mut g, &sites, &impl_self, &impl_trait);
+    g.calls.resolution = vec![Resolution::None; sites.len()];
+    g.calls.target = vec![NodeId::NONE; sites.len()];
+    resolve_edges(&mut g, &sites, &impl_self, &impl_trait, precise);
     st.t_resolve = t.elapsed();
 
     st.files = g.files.len();
     st.nodes = g.nodes.len();
     st.edges = g.edges.len();
+    st.calls = g.calls.len();
+    st.calls_precise = g.calls.resolution.iter().filter(|r| **r == Resolution::Precise).count();
     st.comments = g.comments.len();
     st.t_total = t0.elapsed();
     (g, st)

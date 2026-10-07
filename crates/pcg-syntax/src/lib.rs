@@ -26,8 +26,9 @@ pub mod pcg_comment;
 pub mod resolve;
 pub mod scan;
 
-pub use assemble::{BuildStats, build_graph, build_graph_cached, build_graph_overlaid};
+pub use assemble::{BuildStats, build_graph, build_graph_cached, build_graph_overlaid, build_graph_with};
 pub use cache::{Overlays, ParseCache};
 pub use diff::{GraphDiff, diff};
 pub use edit::{Buffer, Hl, ItemPath};
 pub use pcg_comment::{TextEdit, short_hash, summary_edit};
+pub use resolve::{Precise, node_at, text_hash};

@@ -8,7 +8,7 @@ use crate::model::*;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, futures::check_ready};
 use pcg_core::NodeId;
-use pcg_syntax::{Overlays, ParseCache};
+use pcg_syntax::{Overlays, ParseCache, Precise};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,11 +16,12 @@ pub fn build(
     path: std::path::PathBuf,
     cache: Arc<Mutex<ParseCache>>,
     overlays: Overlays,
+    precise: Option<Arc<Precise>>,
     prev: Option<Arc<Loaded>>,
 ) -> Loaded {
     let (graph, stats) = {
         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-        pcg_syntax::build_graph_overlaid(&path, &mut c, &overlays)
+        pcg_syntax::build_graph_with(&path, &mut c, &overlays, precise.as_deref())
     };
     let t = Instant::now();
     let name_len: Vec<u32> =
@@ -31,7 +32,11 @@ pub fn build(
     let t = Instant::now();
     let diff = prev.map(|p| pcg_syntax::diff(&p.graph.nodes, &graph.nodes));
     let t_diff = t.elapsed();
-    Loaded { graph, layout, stats, t_layout, search_names, diff, t_diff }
+    let lsp_stale = (0..graph.files.len()).any(|f| {
+        let known = precise.as_ref().and_then(|p| p.files.get(&graph.files.path[f]));
+        known != Some(&pcg_syntax::text_hash(&graph.files.source[f]))
+    });
+    Loaded { graph, layout, stats, t_layout, search_names, diff, t_diff, lsp_stale }
 }
 
 pub fn start(
@@ -40,6 +45,7 @@ pub fn start(
     mut cache: ResMut<Cache>,
     project: Res<Project>,
     mut editing: ResMut<Editing>,
+    lsp: Res<Lsp>,
     time: Res<Time>,
 ) {
     if !req.pending || task.task.is_some() {
@@ -54,12 +60,14 @@ pub fn start(
         editing.docs.clear();
     }
     let overlays = crate::edit::overlays(&editing);
+    // Answers for another project's files would simply not apply.
+    let precise = lsp.precise.clone();
     let prev = if same_project { project.data.clone() } else { None };
     let c = cache.cache.clone();
     task.keep_view = req.keep_view && same_project;
     task.path = path.clone();
     task.started = time.elapsed_secs_f64();
-    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path, c, overlays, prev) }));
+    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path, c, overlays, precise, prev) }));
 }
 
 #[allow(clippy::too_many_arguments)]
