@@ -21,6 +21,7 @@ pub fn ui(
     mut scratch: ResMut<CanvasScratch>,
     tr: Res<Transition>,
     watch: Res<Watch>,
+    mut editing: ResMut<Editing>,
     time: Res<Time>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -37,6 +38,7 @@ pub fn ui(
     let data = project.data.clone();
     let mut select: Option<NodeId> = None;
     let mut fly: Option<NodeId> = None;
+    let mut edit: Option<NodeId> = None;
 
     // ---- top bar -----------------------------------------------------------
     egui::Panel::top("top").show(&mut root, |ui| {
@@ -47,8 +49,10 @@ pub fn ui(
                 breadcrumbs(ui, &p.graph, sel.selected, &mut select, &mut fly);
             } else {
                 ui.label(
-                    RichText::new("click a box to select · double-click to focus · scroll to zoom · drag to pan")
-                        .color(theme::TEXT_DIM),
+                    RichText::new(
+                        "click a box to select · double-click to focus · Enter to edit · scroll to zoom · drag to pan",
+                    )
+                    .color(theme::TEXT_DIM),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -121,7 +125,7 @@ pub fn ui(
     {
         egui::Panel::right("inspector").default_size(380.0).show(&mut root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                inspector(ui, p, &mut sel, &mut st, &mut req, &mut select, &mut fly);
+                inspector(ui, p, &mut sel, &mut st, &mut req, &mut select, &mut fly, &mut edit);
             });
         });
     }
@@ -150,11 +154,21 @@ pub fn ui(
 
     // ---- keyboard ----------------------------------------------------------------
     if let Some(p) = &data {
-        let (esc, f, back) = ctx.input(|i| {
-            (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::F), i.key_pressed(egui::Key::Backspace))
+        let (esc, f, back, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::Backspace),
+                i.key_pressed(egui::Key::Enter),
+            )
         });
+        // While an editor is open, Esc belongs to it.
+        let editing_now = editing.session.is_some();
         if !ctx.egui_wants_keyboard_input() {
-            if esc {
+            if enter && sel.selected.is_some() {
+                edit = Some(sel.selected);
+            }
+            if esc && !editing_now {
                 select = Some(NodeId::NONE);
             }
             if f {
@@ -168,6 +182,21 @@ pub fn ui(
                 }
             }
         }
+        // ---- in-node editor ---------------------------------------------------
+        if let Some(n) = edit {
+            if editing.session.as_ref().is_some_and(|s| s.dirty) {
+                st.status = "save or discard the open editor first".into();
+            } else if editing.session.as_ref().is_some_and(|s| s.node == n) {
+                // Already editing this node.
+            } else if let Some(s) = crate::edit::open(p, n) {
+                editing.session = Some(s);
+                fly = Some(n);
+            } else {
+                st.status = "this node has no source to edit".into();
+            }
+        }
+        crate::edit::editor(ctx, p, &view, &mut editing, &mut st, &mut req, now);
+
         if let Some(n) = fly {
             view.fly_to_node(&p.layout, n);
         }
@@ -242,6 +271,7 @@ fn node_link(ui: &mut Ui, g: &Graph, n: NodeId, extra: &str, select: &mut Option
     r.on_hover_text(g.qualified_name(n));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspector(
     ui: &mut Ui,
     p: &Loaded,
@@ -250,6 +280,7 @@ fn inspector(
     req: &mut LoadRequest,
     select: &mut Option<NodeId>,
     fly: &mut Option<NodeId>,
+    edit: &mut Option<NodeId>,
 ) {
     let g = &p.graph;
     let n = sel.selected;
@@ -369,6 +400,9 @@ fn inspector(
     // Code.
     let src = g.source(n);
     if !src.is_empty() {
+        if ui.button("✏ Edit").on_hover_text("Edit this node's source in place (Enter)").clicked() {
+            *edit = Some(n);
+        }
         egui::CollapsingHeader::new("code").default_open(!kind.is_container()).show(ui, |ui| {
             let shown: String = src.lines().take(400).collect::<Vec<_>>().join("\n");
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {

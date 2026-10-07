@@ -5,7 +5,7 @@ use bevy::tasks::Task;
 use bevy_egui::egui;
 use pcg_core::{Graph, NodeId};
 use pcg_layout::Layout;
-use pcg_syntax::{BuildStats, GraphDiff, ParseCache};
+use pcg_syntax::{Buffer, BuildStats, GraphDiff, ParseCache};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +118,40 @@ impl Default for Selection {
     fn default() -> Self {
         Self { selected: NodeId::NONE, hovered: NodeId::NONE, changed_at: 0.0 }
     }
+}
+
+/// The in-node editor (at most one open at a time).
+#[derive(Resource, Default)]
+pub struct Editing {
+    pub session: Option<EditSession>,
+}
+
+pub struct EditSession {
+    pub path: PathBuf,
+    /// Editor caption: the edited node, as last seen in a snapshot.
+    pub title: String,
+    /// The whole file, with its syntax tree.
+    pub buffer: Buffer,
+    /// On-disk text the buffer started from / was last saved as (save guard).
+    pub base: Arc<str>,
+    /// The edited node's bytes in `buffer`.
+    pub span: std::ops::Range<usize>,
+    /// `span`'s text as shown in the editor (LF line endings).
+    pub draft: String,
+    pub crlf: bool,
+    /// Buffer differs from `base`.
+    pub dirty: bool,
+    /// The edited node in the current snapshot (`NONE` while it does not parse).
+    pub node: NodeId,
+    /// World rect the editor sits on (the node's, as last seen).
+    pub anchor: [f32; 4],
+    /// Time of the last keystroke (debounces the live rebuild).
+    pub changed_at: f64,
+    /// Buffer changed since the last rebuild was requested.
+    pub graph_stale: bool,
+    pub want_focus: bool,
+    /// Esc was pressed once on unsaved text.
+    pub discard_armed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

@@ -8,14 +8,16 @@
 //! | system            | schedule               | reads → writes                          |
 //! |-------------------|------------------------|-----------------------------------------|
 //! | `watch::poll`     | Update                 | `Watch` → `LoadRequest` (debounced)     |
-//! | `load::start`     | Update                 | `LoadRequest`, `Cache` → `LoadTask`     |
-//! | `load::poll`      | Update                 | `LoadTask` → `Project`, `Transition`, `View`, `Selection`, `Watch` |
+//! | `edit::poll`      | Update                 | `Editing` → `LoadRequest` (debounced live rebuild) |
+//! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay) → `LoadTask` |
+//! | `load::poll`      | Update                 | `LoadTask` → `Project`, `Transition`, `View`, `Selection`, `Watch`, `Editing` |
 //! | `anim::end`       | Update                 | `Time` → `Transition` (drops old snapshot) |
 //! | `view::animate`   | Update                 | `Time` → `View`                         |
-//! | `ui::ui`          | EguiPrimaryContextPass | everything → `View`, `Selection`, `UiState`, `LoadRequest` |
+//! | `ui::ui`          | EguiPrimaryContextPass | everything → `View`, `Selection`, `UiState`, `Editing`, `LoadRequest` |
 
 mod anim;
 mod canvas;
+mod edit;
 mod load;
 mod model;
 mod theme;
@@ -51,8 +53,9 @@ fn main() {
         .init_resource::<Transition>()
         .init_resource::<Cache>()
         .init_resource::<Watch>()
+        .init_resource::<Editing>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (watch::poll, load::start, load::poll, anim::end, view::animate).chain())
+        .add_systems(Update, (watch::poll, edit::poll, load::start, load::poll, anim::end, view::animate).chain())
         .add_systems(EguiPrimaryContextPass, ui::ui)
         .run();
 }

@@ -113,3 +113,39 @@ fn diff_flags() {
     assert!(d.new_of_old[find(&g1, "demo::a::S").idx()].is_none());
     assert_eq!(d.exit_roots.len(), 3); // S and the two impl blocks, not m / n
 }
+
+#[test]
+fn overlay_wins_over_disk_until_saved() {
+    use pcg_syntax::{Buffer, Overlays, build_graph_overlaid};
+    let root = tmp("overlay");
+    fixture(&root);
+    let mut cache = ParseCache::default();
+    let (g1, _) = build_graph_cached(&root, &mut cache);
+    let fb = find(&g1, "demo::b::fb");
+    let file = g1.nodes.file[fb.idx()];
+    let path = g1.files.path[file.idx()].clone();
+
+    // Edit `fb` in a buffer: the graph follows, the disk does not.
+    let mut buf = Buffer::new(g1.files.source[file.idx()].to_string());
+    let span = buf.replace_span(g1.nodes.bytes[fb.idx()].range(), "pub fn fb() { fb2() }\npub fn fb2() {}");
+    assert_eq!(&buf.text()[span], "pub fn fb() { fb2() }\npub fn fb2() {}");
+    let mut ov = Overlays::default();
+    ov.insert(path.clone(), (buf.text().into(), buf.syntax().clone()));
+    let (g2, st) = build_graph_overlaid(&root, &mut cache, &ov);
+    assert_eq!(st.files_parsed, 0);
+    let fb2 = find(&g2, "demo::b::fb2");
+    assert_eq!(g2.edges.out.of(find(&g2, "demo::b::fb")).len(), 1);
+    assert_eq!(g2.source(fb2), "pub fn fb2() {}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "pub fn fb() {}\n");
+
+    // Saving the buffer and dropping the overlay changes nothing (same bytes: no reparse).
+    fs::write(&path, buf.text()).unwrap();
+    let (g3, st) = build_graph_cached(&root, &mut cache);
+    assert_eq!(st.files_parsed, 0);
+    assert!(diff(&g2.nodes, &g3.nodes).is_empty());
+
+    // Discarding instead brings the disk text back.
+    fs::write(&path, "pub fn fb() {}\n").unwrap();
+    let (g4, _) = build_graph_cached(&root, &mut cache);
+    assert!(diff(&g1.nodes, &g4.nodes).is_empty());
+}

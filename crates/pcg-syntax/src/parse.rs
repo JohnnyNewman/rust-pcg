@@ -6,7 +6,7 @@
 use crate::pcg_comment::{RawPcgComment, parse_doc_lines};
 use pcg_core::{CommentKind, NodeKind, Span};
 use std::cell::RefCell;
-use tree_sitter::{Node, Parser, TreeCursor};
+use tree_sitter::{Node, Parser, Tree, TreeCursor};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 pub const LOCAL_NONE: u32 = u32::MAX;
@@ -78,7 +78,22 @@ thread_local! {
 }
 
 pub fn parse_file(src: &str) -> FileSyntax {
-    let tree = PARSER.with_borrow_mut(|p| p.parse(src, None)).expect("parser has a language");
+    parse_tree(src, None).0
+    // The tree is dropped here: syntax trees are ~10x the source size, so keeping
+    // all of them does not scale. Only files open in an editor keep theirs
+    // (see [`crate::edit::Buffer`]).
+}
+
+/// Parse `src` and keep the syntax tree. With `old` — the previous tree, already
+/// [`Tree::edit`]ed to describe how the text changed — tree-sitter reuses every
+/// subtree the edit did not touch.
+pub fn parse_tree(src: &str, old: Option<&Tree>) -> (FileSyntax, Tree) {
+    let tree = PARSER.with_borrow_mut(|p| p.parse(src, old)).expect("parser has a language");
+    (extract(&tree, src), tree)
+}
+
+/// Extraction: one syntax tree → file-local tables.
+fn extract(tree: &Tree, src: &str) -> FileSyntax {
     let mut cx = Cx {
         src: src.as_bytes(),
         items: LocalItems::default(),
@@ -91,8 +106,6 @@ pub fn parse_file(src: &str) -> FileSyntax {
     cx.declarations(root, LOCAL_NONE);
     let file_hash = hash_tokens(root, cx.src, &cx.code, &mut cx.items.hash);
     FileSyntax { has_errors: root.has_error(), items: cx.items, calls: cx.calls, comments: cx.comments, file_hash }
-    // `tree` is dropped here: syntax trees are ~10x the source size, so keeping
-    // all of them does not scale. M2 adds a bounded tree cache for incremental reparse.
 }
 
 #[inline]

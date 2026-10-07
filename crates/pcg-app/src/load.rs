@@ -1,20 +1,26 @@
 //! Background loading: the static pipeline runs on the async compute pool and
 //! hands back an immutable [`Loaded`] snapshot. Reloads of the same project
 //! reuse the [`Cache`] (only changed files are re-parsed) and carry a diff
-//! against the previous snapshot, which drives the [`Transition`].
+//! against the previous snapshot, which drives the [`Transition`]. Unsaved
+//! editor text ([`Editing`]) enters the build as an overlay.
 
 use crate::model::*;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, futures::check_ready};
 use pcg_core::NodeId;
-use pcg_syntax::ParseCache;
+use pcg_syntax::{Overlays, ParseCache};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub fn build(path: std::path::PathBuf, cache: Arc<Mutex<ParseCache>>, prev: Option<Arc<Loaded>>) -> Loaded {
+pub fn build(
+    path: std::path::PathBuf,
+    cache: Arc<Mutex<ParseCache>>,
+    overlays: Overlays,
+    prev: Option<Arc<Loaded>>,
+) -> Loaded {
     let (graph, stats) = {
         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-        pcg_syntax::build_graph_cached(&path, &mut c)
+        pcg_syntax::build_graph_overlaid(&path, &mut c, &overlays)
     };
     let t = Instant::now();
     let name_len: Vec<u32> =
@@ -33,6 +39,7 @@ pub fn start(
     mut task: ResMut<LoadTask>,
     mut cache: ResMut<Cache>,
     project: Res<Project>,
+    mut editing: ResMut<Editing>,
     time: Res<Time>,
 ) {
     if !req.pending || task.task.is_some() {
@@ -44,13 +51,15 @@ pub fn start(
     let same_project = cache.root == path && project.data.is_some();
     if !same_project {
         *cache = Cache { root: path.clone(), ..default() };
+        editing.session = None;
     }
+    let overlays = crate::edit::overlays(&editing);
     let prev = if same_project { project.data.clone() } else { None };
     let c = cache.cache.clone();
     task.keep_view = req.keep_view && same_project;
     task.path = path.clone();
     task.started = time.elapsed_secs_f64();
-    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path, c, prev) }));
+    task.task = Some(AsyncComputeTaskPool::get().spawn(async move { build(path, c, overlays, prev) }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,6 +71,7 @@ pub fn poll(
     mut ui: ResMut<UiState>,
     mut tr: ResMut<Transition>,
     mut watch: ResMut<Watch>,
+    mut editing: ResMut<Editing>,
     time: Res<Time>,
 ) {
     let Some(t) = task.task.as_mut() else { return };
@@ -87,6 +97,12 @@ pub fn poll(
     sel.selected = selected;
     sel.hovered = NodeId::NONE;
     ui.search_for.clear(); // invalidate search hits (ids changed)
+    if let Some(s) = editing.session.as_mut()
+        && !crate::edit::rebind(s, &loaded)
+    {
+        editing.session = None;
+        ui.status += "\neditor closed: its file changed on disk";
+    }
 
     if task.keep_view {
         // Animate only if something actually changed.

@@ -15,8 +15,10 @@
 //!
 //! Syntax trees are not cached: an external save gives no edit ranges, so
 //! tree-sitter's incremental reparse has nothing to work with, and a fresh
-//! per-file parse is already ~1 ms. M3 (in-editor edits with known ranges) is
-//! where a bounded tree cache pays off.
+//! per-file parse is already ~1 ms. Files open in an editor are different:
+//! their edits have known ranges, so a [`crate::edit::Buffer`] keeps the tree
+//! and hands its result to the build as an [`Overlays`] entry, which wins over
+//! whatever is on disk.
 
 use crate::parse::{FileSyntax, parse_file};
 use rustc_hash::FxHashMap;
@@ -41,6 +43,10 @@ pub struct ParseCache {
     pub built_at: Option<SystemTime>,
 }
 
+/// Unsaved editor buffers by path: text + parse that replace the file's
+/// on-disk content for one build.
+pub type Overlays = FxHashMap<PathBuf, (Arc<str>, Arc<FileSyntax>)>;
+
 /// How a file's parse was obtained.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fetch {
@@ -50,6 +56,8 @@ pub enum Fetch {
     SameBytes,
     /// Parsed (new or changed).
     Parsed,
+    /// Taken from an unsaved editor buffer.
+    Overlay,
 }
 
 impl ParseCache {
@@ -63,7 +71,11 @@ impl ParseCache {
 
 /// Look up or (re)parse one file. Pure w.r.t. the cache (read-only), so it can
 /// run in parallel; the caller writes the results back.
-pub fn fetch(cache: &ParseCache, path: &Path) -> Option<(CachedFile, Fetch)> {
+pub fn fetch(cache: &ParseCache, overlays: &Overlays, path: &Path) -> Option<(CachedFile, Fetch)> {
+    if let Some((src, syn)) = overlays.get(path) {
+        // No mtime: once the overlay is gone the file is re-read and compared.
+        return Some((CachedFile { mtime: None, len: 0, src: src.clone(), syn: syn.clone() }, Fetch::Overlay));
+    }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok();
     let len = meta.len();

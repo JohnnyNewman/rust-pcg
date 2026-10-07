@@ -1,6 +1,6 @@
 //! Serial assembly: file-local parse results → global pre-order tables.
 
-use crate::cache::{Fetch, ParseCache, fetch};
+use crate::cache::{Fetch, Overlays, ParseCache, fetch};
 use crate::parse::{CalleeForm, LOCAL_NONE};
 use crate::pcg_comment::short_hash;
 use crate::resolve::{CallForm, CallSites, resolve_edges};
@@ -66,6 +66,12 @@ pub fn build_graph(root: &Path) -> (Graph, BuildStats) {
 /// Run the full static pipeline, re-parsing only files whose text changed
 /// since `cache` was filled. Updates `cache` (and evicts deleted files).
 pub fn build_graph_cached(root: &Path, cache: &mut ParseCache) -> (Graph, BuildStats) {
+    build_graph_overlaid(root, cache, &Overlays::default())
+}
+
+/// [`build_graph_cached`], with unsaved editor buffers taking the place of
+/// their files' on-disk text.
+pub fn build_graph_overlaid(root: &Path, cache: &mut ParseCache, overlays: &Overlays) -> (Graph, BuildStats) {
     let t0 = Instant::now();
     let wall0 = std::time::SystemTime::now();
     let mut st = BuildStats::default();
@@ -76,7 +82,7 @@ pub fn build_graph_cached(root: &Path, cache: &mut ParseCache) -> (Graph, BuildS
 
     // --- parse (parallel, cached) ----------------------------------------
     let t = Instant::now();
-    let fetched: Vec<_> = sc.files.par_iter().map(|f| fetch(cache, &f.path)).collect();
+    let fetched: Vec<_> = sc.files.par_iter().map(|f| fetch(cache, overlays, &f.path)).collect();
     st.files_parsed = fetched.iter().flatten().filter(|(_, how)| *how == Fetch::Parsed).count();
     cache.files.clear();
     for (f, r) in sc.files.iter().zip(&fetched) {

@@ -5,7 +5,8 @@ A visual IDE (Blueprint-like, but for general-purpose code) written in Rust with
 is a projection of it. See the project docs (*vision-and-decisions*,
 *roadmap-and-architecture*) for the full design.
 
-**Status: M1 (skeleton & static graph) implemented.**
+**Status: M1 (skeleton & static graph), M2 (incremental reload, animated diff) and
+M3 (in-node editing) implemented.**
 
 ![Focus on a function: callers (orange) and callees (blue) with flowing dots](docs/screenshots/focus-edges.png)
 
@@ -15,6 +16,7 @@ is a projection of it. See the project docs (*vision-and-decisions*,
 cargo run --release -p pcg-app -- <path-to-a-rust-project>   # default: current dir (dogfooding)
 cargo run --release -p pcg-syntax --example dump -- <dir> [--tree]   # headless pipeline + timings
 cargo run --release -p pcg-syntax --example parse_bench -- <dir>      # tree-sitter vs. extraction cost
+cargo run --release -p pcg-syntax --example edit_bench -- <file.rs>   # cost of one keystroke in an open file
 cargo test --workspace
 ```
 
@@ -33,6 +35,7 @@ On Windows the MSVC toolchain is required (tree-sitter compiles C code).
 | search box | find by name, click to fly there |
 | *code face / summary face* | what leaves show at deep zoom |
 | *all edges* | aggregated call graph on the visible boxes |
+| `Enter` / inspector → *Edit* | edit the selected node's source in place. The graph follows the unsaved text live (calls, new items, the diff animation); nothing touches the disk until `Ctrl+S` / *Save*. `Esc` closes (asks once before discarding unsaved text). |
 | inspector → *Accept & write summary* | writes a `@pcg:summary[h=…]` comment into the file (only on this explicit accept, decision 7) and reloads |
 | *(save a file in any editor)* | the project is watched: only changed files are re-parsed, and the graph animates the diff — moved boxes glide, new ones fade in (green), removed ones fade out (red), changed ones glow (yellow). Selection follows the node by identity. |
 
@@ -41,8 +44,9 @@ On Windows the MSVC toolchain is required (tree-sitter compiles C code).
 ```
 crates/
   pcg-core/    data only: dense ids, interner, SoA tables (nodes, edges, files, @pcg comments)
-  pcg-syntax/  stages: scan → parse (rayon, tree-sitter) → assemble → @pcg comments → resolve edges
-  pcg-layout/  nested-box layout, two linear passes (M1 placeholder for the M2 engine)
+  pcg-syntax/  stages: scan → parse (rayon, tree-sitter) → assemble → @pcg comments → resolve edges;
+               `Buffer` = an open file (text + syntax tree, edit-range reparse)
+  pcg-layout/  nested-box layout, two linear passes (placeholder for the real engine)
   pcg-app/     Bevy shell + egui panels/canvas; resources = data, systems = control flow
 ```
 
@@ -63,6 +67,21 @@ crates/
   culls off-screen / sub-pixel subtrees in O(1) each. Semantic zoom is continuous —
   children fade in as their parent's on-screen size crosses a threshold, so zooming
   itself animates the level-of-detail change.
+
+### In-node editing
+
+The editor owns a `Buffer` for the node's file — the only place a syntax tree is
+kept — and a byte span into it. Each keystroke is one minimal edit: `Tree::edit` +
+tree-sitter's incremental reparse, then the extraction pass. A quarter second after
+the last keystroke the pipeline is re-run with the buffer as an *overlay* that
+replaces the file's on-disk text, so the graph is always a projection of what you
+see, saved or not. The editor is anchored to the byte span, not to a node id: an
+item that is renamed or briefly does not parse is re-found after each rebuild.
+Saving refuses to write if the file changed on disk since the editor opened, and
+keeps the file's line endings.
+
+One keystroke in a 21 kB file costs ~3.5 ms (full parse: ~9 ms); in a 350 kB file
+~50 ms (full: ~86 ms). Extraction is still a whole-file pass and now dominates.
 
 ### `@pcg` comments
 
@@ -99,11 +118,15 @@ draws only ~1–5 k boxes per frame.
   same-file → same-crate → global, ambiguous calls dropped, common std method names
   skipped, unqualified method calls stay inside the crate). Precise resolution = LSP (M6).
   Calls inside macro arguments (`println!(…f()…)`) are not seen by tree-sitter.
-* Syntax trees are dropped after extraction (memory). Reloads are incremental per *file*
-  (a parse cache keyed by mtime/size/bytes), not per edit: an external save gives no
-  edit ranges for tree-sitter. Edit-range reparse comes with in-node editing (M3).
+* Syntax trees are dropped after extraction (memory), except for the file open in the
+  editor. External saves reload per *file* (a parse cache keyed by mtime/size/bytes):
+  they give no edit ranges for tree-sitter.
+* In-node editing: one editor at a time, plain text (no syntax highlighting, completion
+  or undo across sessions). Extraction after an edit re-walks the whole file, and the
+  live rebuild re-runs assemble + resolve over the whole project.
 * Stable node identity is `(parent, kind, name, ordinal)`: renaming an item, or moving
   it to another module, reads as exit + enter, not as a move.
 * Layout is a simple shelf-packing of nested boxes; edges are drawn as beziers between
-  the currently visible representatives. Real hierarchical layout + edge routing = M2.
-* Rendering uses egui's painter; GPU instancing / custom WGSL comes with M2/M5.
+  the currently visible representatives. Real hierarchical layout + edge routing is
+  still open.
+* Rendering uses egui's painter; GPU instancing / custom WGSL comes with M5.
