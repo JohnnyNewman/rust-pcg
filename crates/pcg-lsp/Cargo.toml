@@ -1,0 +1,12 @@
+[package]
+name = "pcg-lsp"
+description = "Language-server client of the pcg IDE: asks rust-analyzer where each call site's callee is defined."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcg-core.workspace = true
+pcg-syntax.workspace = true
+rustc-hash.workspace = true
+serde_json.workspace = true

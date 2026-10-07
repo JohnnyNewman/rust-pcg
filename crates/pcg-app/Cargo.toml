@@ -13,6 +13,7 @@ path = "src/main.rs"
 pcg-core.workspace = true
 pcg-syntax.workspace = true
 pcg-layout.workspace = true
+pcg-lsp.workspace = true
 bevy.workspace = true
 bevy_egui.workspace = true
 rustc-hash.workspace = true

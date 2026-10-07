@@ -479,7 +479,7 @@ mod tests {
     fn type_rebuild_save() {
         let root = project("flow", "fn a() {}\r\n\r\nfn b() {\r\n    1;\r\n}\r\n");
         let cache = Arc::default();
-        let build = |ed: &Editing, prev| crate::load::build(root.clone(), Arc::clone(&cache), overlays(ed), prev);
+        let build = |ed: &Editing, prev| crate::load::build(root.clone(), Arc::clone(&cache), overlays(ed), None, prev);
         let p0 = Arc::new(build(&Editing::default(), None));
         let mut ed = Editing::default();
         open(&mut ed, &p0, find(&p0, "b")).unwrap();
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn editors_of_one_file_share_the_buffer() {
         let root = project("multi", "fn a() {}\n\nmod m {\n    fn b() {}\n}\n\nfn c() {}\n");
-        let p = crate::load::build(root.clone(), Arc::default(), Overlays::default(), None);
+        let p = crate::load::build(root.clone(), Arc::default(), Overlays::default(), None, None);
         let mut ed = Editing::default();
         open(&mut ed, &p, find(&p, "a")).unwrap();
         open(&mut ed, &p, find(&p, "c")).unwrap();
@@ -544,7 +544,7 @@ mod tests {
         let root = project("guard", "fn a() {}\nfn gone() {}\n");
         let disk = root.join("src/lib.rs");
         let cache = Arc::default();
-        let build = |ed: &Editing| crate::load::build(root.clone(), Arc::clone(&cache), overlays(ed), None);
+        let build = |ed: &Editing| crate::load::build(root.clone(), Arc::clone(&cache), overlays(ed), None, None);
         let p0 = build(&Editing::default());
         let mut ed = Editing::default();
         open(&mut ed, &p0, find(&p0, "a")).unwrap();

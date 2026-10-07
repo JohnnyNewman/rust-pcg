@@ -5,7 +5,7 @@ use bevy::tasks::Task;
 use bevy_egui::egui;
 use pcg_core::{Graph, NodeId};
 use pcg_layout::Layout;
-use pcg_syntax::{Buffer, BuildStats, GraphDiff, ItemPath, ParseCache};
+use pcg_syntax::{Buffer, BuildStats, GraphDiff, ItemPath, ParseCache, Precise};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,29 @@ pub struct Loaded {
     /// Diff against the snapshot this one replaced (same project only).
     pub diff: Option<GraphDiff>,
     pub t_diff: Duration,
+    /// Some file's text is not what the language server was last asked about.
+    pub lsp_stale: bool,
+}
+
+/// The language server (rust-analyzer) behind the precise call edges.
+#[derive(Resource, Default)]
+pub struct Lsp {
+    /// Off with `--no-lsp`.
+    pub enabled: bool,
+    /// Project the worker thread was started for.
+    pub root: PathBuf,
+    /// Snapshots to resolve, to the worker.
+    pub jobs: Option<std::sync::mpsc::Sender<Arc<Loaded>>>,
+    pub events: Option<std::sync::Mutex<std::sync::mpsc::Receiver<crate::lsp::Event>>>,
+    /// Latest answers; every build applies what still matches the text.
+    pub precise: Option<Arc<Precise>>,
+    /// What the server is doing, for the side panel.
+    pub status: String,
+    /// A snapshot is with the worker.
+    pub busy: bool,
+    pub failed: bool,
+    /// Identity of the snapshot last sent.
+    pub asked: usize,
 }
 
 /// The animated hand-over from one snapshot to the next. While active, the

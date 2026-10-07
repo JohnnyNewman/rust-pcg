@@ -6,14 +6,15 @@ is a projection of it. See the project docs (*vision-and-decisions*,
 *roadmap-and-architecture*) for the full design.
 
 **Status: M1 (skeleton & static graph), M2 (incremental reload, animated diff),
-M3 (in-node editing) and the layered layout with edge routing implemented.**
+M3 (in-node editing), the layered layout with edge routing, and M6 (precise call
+edges from rust-analyzer) implemented.**
 
 ![Focus on a function: callers (orange) and callees (blue) with flowing dots](docs/screenshots/focus-edges.png)
 
 ## Run
 
 ```sh
-cargo run --release -p pcg-app -- <path-to-a-rust-project>   # default: current dir (dogfooding)
+cargo run --release -p pcg-app -- [--no-lsp] <path-to-a-rust-project>   # default: current dir (dogfooding)
 cargo run --release -p pcg-syntax --example dump -- <dir> [--tree]   # headless pipeline + timings
 cargo run --release -p pcg-syntax --example parse_bench -- <dir>      # tree-sitter vs. extraction cost
 cargo run --release -p pcg-syntax --example edit_bench -- <file.rs>   # cost of one keystroke in an open file
@@ -24,6 +25,8 @@ cargo test --workspace
 First build compiles Bevy (several minutes). `dev` builds use `opt-level = 1` for
 our crates and `3` for dependencies, so debug runs are usable.
 On Windows the MSVC toolchain is required (tree-sitter compiles C code).
+Precise call edges need `rust-analyzer` on the `PATH` (`rustup component add
+rust-analyzer`); without it, or with `--no-lsp`, edges are name-based.
 
 ### Controls
 
@@ -48,7 +51,8 @@ crates/
   pcg-syntax/  stages: scan → parse (rayon, tree-sitter) → assemble → @pcg comments → resolve edges;
                `Buffer` = an open file (text + syntax tree, edit-range reparse)
   pcg-layout/  nested boxes, two linear passes; per container a layered (call-flow) or shelf
-               arrangement, plus routes for the edges that skip columns
+               arrangement, plus a route for every edge between or through containers
+  pcg-lsp/     rust-analyzer client: where is each call site's callee defined?
   pcg-app/     Bevy shell + egui panels/canvas; resources = data, systems = control flow
 ```
 
@@ -95,18 +99,41 @@ One keystroke in a 21 kB file costs ~3.5 ms (full parse: ~9 ms); in a 350 kB fil
 Every edge is lifted to the two siblings below its ends' lowest common ancestor, so
 each container sees the call graph *between its children* — functions in a module,
 modules in a crate, crates in the workspace. Children with such edges are layered
-Sugiyama-style: cycles broken by a DFS, longest-path layers (callers left of
-callees), a lane reserved in every column a longer edge crosses, a few barycentre
-sweeps against crossings. The rest is shelf-packed below, as are containers where
-layering would be lopsided (one caller of fifty) or too big.
+Sugiyama-style: cycles broken by a DFS, longest-path layers (callers before
+callees), a lane reserved in every layer a longer edge crosses, a few barycentre
+sweeps against crossings. Layers run left-to-right or top-to-bottom and wrap into
+several bands — whichever brings the box closest to the target aspect. The rest is
+shelf-packed beside it, as are containers where layering would be lopsided (one
+caller of fifty) or too big.
 
-Edges are drawn at that same level: along the reserved lanes where there are any,
-otherwise as one curve between the boxes' facing sides. Edges whose ends lie deeper
-first run to that port on their container's side, so everything between two
-containers travels as one bundle and only fans out inside them.
+Every such edge gets a route: an orthogonal polyline through the gutters between
+layers, along the lanes, and around the band ends — between the boxes, never across
+them. Edges that leave or enter a container are collected on a bus (one lane per
+layer) ending in a port on the container's side, where the route one level up takes
+over. So an edge between two distant functions is drawn level by level — out of its
+module, across the crate, into the other module — and shares each stretch with every
+other edge going the same way.
 
-This repo: 0.2 ms. `~/.cargo/registry/src` (1.5 M nodes, 840 k edges): 315 ms, of
-which 68 ms is the plain shelf pass.
+This repo: 0.4 ms, root box 1.7:1 (plain layering: 4:1). `~/.cargo/registry/src`
+(1.5 M nodes, 840 k edges): 540 ms, 219 k routes; the shelf pass alone is 41 ms.
+
+### Precise call edges (rust-analyzer)
+
+tree-sitter sees *that* `x.len()` is a call, not *which* `len`. So the graph first
+appears with name-based edges, and a background thread asks rust-analyzer for the
+definition behind every call site (`textDocument/definition` at the callee's name).
+When the answers arrive the graph is rebuilt with them: one edge to the real
+definition, none for calls into std or dependencies. Sites the server cannot answer
+keep the name-based guess; the side panel shows how many were resolved.
+
+The server is given every file's text exactly as the snapshot has it — including
+unsaved editor buffers — and answers are only applied to text with the same hash, so
+an edit falls back to the guess for that file until the server has been asked again.
+It runs with build scripts, proc macros and `cargo check` off: it never builds in
+your target directory, and does not see through generated code.
+
+This repo (a Bevy workspace): 3818 of 3884 call sites answered 37 s after start,
+333 name-based edges become 557 precise ones.
 
 ### `@pcg` comments
 
@@ -129,7 +156,7 @@ changed on disk since analysis.
 | this repo | 21 | 0.1 MB | 253 | 134 | 36 ms |
 | `~/.cargo/registry/src` (bevy, wgpu, windows-sys, …) | 12 243 | 200 MB / 5.5 M lines | 869 k | 384 k | 25 s, ~620 MB peak RSS |
 
-Layout of 869 k nodes: 53 ms. The parse stage is ~1.3× raw tree-sitter time
+The parse stage is ~1.3× raw tree-sitter time
 (tree-sitter itself: ~13 MB/s on 2 threads). With the whole registry loaded the canvas
 draws only ~1–5 k boxes per frame.
 
@@ -139,10 +166,14 @@ draws only ~1–5 k boxes per frame.
 
 ## Known limitations
 
-* **Call edges are name-based heuristics** (free fn / method / `Type::f` / macro, ranked
-  same-file → same-crate → global, ambiguous calls dropped, common std method names
-  skipped, unqualified method calls stay inside the crate). Precise resolution = LSP (M6).
-  Calls inside macro arguments (`println!(…f()…)`) are not seen by tree-sitter.
+* **Call edges** are precise only once rust-analyzer has answered, and only as far as
+  it sees: with proc macros and build scripts off, calls on types that come out of
+  generated code may stay unanswered. Until then, and for those, edges are name-based
+  heuristics (free fn / method / `Type::f` / macro, ranked same-file → same-crate →
+  global, ambiguous calls dropped, common std method names skipped). Every edit
+  re-asks all call sites, not just the changed file's. Calls through a generic bound
+  or trait object point at the trait's declaration, not at the impls. Calls inside macro arguments
+  (`println!(…f()…)`) are not seen by tree-sitter at all.
 * Syntax trees are dropped after extraction (memory), except for the file open in the
   editor. External saves reload per *file* (a parse cache keyed by mtime/size/bytes):
   they give no edit ranges for tree-sitter.
@@ -151,9 +182,10 @@ draws only ~1–5 k boxes per frame.
   the whole file, and the live rebuild re-runs assemble + resolve over the whole project.
 * Stable node identity is `(parent, kind, name, ordinal)`: renaming an item, or moving
   it to another module, reads as exit + enter, not as a move.
-* Layout: layered containers grow wide (this repo's root is ~4:1), columns are only
-  centred, not aligned to straighten edges, and a call-graph change can reshuffle a
-  container. Routing avoids boxes only between siblings (lanes); a bundle between two
-  containers is a single curve and can still clip a third box. The "all edges" overlay
-  draws straight lines.
+* Layout: a call-graph change can reshuffle a container; layers are centred in their
+  band, not aligned to straighten edges; wrapped layouts leave empty corners. Edges
+  sharing a gutter or bus are drawn on top of each other (one line, many dots). Where
+  a container's layers and its parent's run along different axes, the edge walks
+  around the container's corner. Shelf-packed containers have no routes: edges cross
+  them as plain curves. The "all edges" overlay draws straight lines.
 * Rendering uses egui's painter; GPU instancing / custom WGSL comes with M5.
