@@ -3642,6 +3642,7 @@ name = "pcg-layout"
 version = "0.1.0"
 dependencies = [
  "pcg-core",
+ "pcg-syntax",
 ]
 
 [[package]]

@@ -7,11 +7,66 @@
 //! result up as an *overlay* (see [`crate::cache::Overlays`]), so the graph can
 //! show unsaved text without it ever touching the disk.
 
-use crate::parse::{FileSyntax, parse_tree};
+use crate::parse::{FileSyntax, LOCAL_NONE, parse_tree};
+use pcg_core::NodeKind;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tree_sitter::{InputEdit, Point, Tree};
+use tree_sitter::{InputEdit, Node, Point, Tree};
+
+/// Highlight class of a token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hl {
+    Keyword,
+    Type,
+    Function,
+    Macro,
+    String,
+    Number,
+    Comment,
+    Attribute,
+    Lifetime,
+}
+
+/// An item's identity inside its file, independent of byte offsets: per
+/// nesting level `(kind, name, ordinal among same-named siblings)`.
+pub type ItemPath = Vec<(NodeKind, String, u32)>;
+
+fn classify(n: Node) -> Option<Hl> {
+    let k = n.kind();
+    Some(match k {
+        "line_comment" | "block_comment" => Hl::Comment,
+        "string_literal" | "raw_string_literal" | "char_literal" => Hl::String,
+        "integer_literal" | "float_literal" | "boolean_literal" => Hl::Number,
+        "type_identifier" | "primitive_type" => Hl::Type,
+        "lifetime" => Hl::Lifetime,
+        "attribute_item" | "inner_attribute_item" => Hl::Attribute,
+        "mutable_specifier" | "self" | "super" | "crate" => Hl::Keyword,
+        "identifier" | "field_identifier" => {
+            let p = n.parent()?;
+            let is = |of: Node, field: &str| of.child_by_field_name(field) == Some(n);
+            match p.kind() {
+                "function_item" | "function_signature_item" if is(p, "name") => Hl::Function,
+                "call_expression" if is(p, "function") => Hl::Function,
+                "macro_invocation" if is(p, "macro") => Hl::Macro,
+                "macro_definition" if is(p, "name") => Hl::Macro,
+                // `a::b::f(..)`, `x.f(..)`, `a::m!(..)`
+                "scoped_identifier" | "field_expression" if is(p, "name") || is(p, "field") => {
+                    let g = p.parent()?;
+                    match g.kind() {
+                        "call_expression" if g.child_by_field_name("function") == Some(p) => Hl::Function,
+                        "macro_invocation" if g.child_by_field_name("macro") == Some(p) => Hl::Macro,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Anonymous word tokens are the keywords (`fn`, `let`, `impl`, …).
+        _ if !n.is_named() && n.child_count() == 0 && k.bytes().all(|b| b.is_ascii_lowercase()) => Hl::Keyword,
+        _ => return None,
+    })
+}
 
 pub struct Buffer {
     text: String,
@@ -42,6 +97,69 @@ impl Buffer {
 
     pub fn syntax(&self) -> &Arc<FileSyntax> {
         &self.syn
+    }
+
+    /// Highlighted tokens inside `span`: ascending, disjoint, clipped to it.
+    /// Read off the syntax tree, so it costs a walk over the span only.
+    pub fn highlights(&self, span: Range<usize>) -> Vec<(Range<usize>, Hl)> {
+        let mut out = Vec::new();
+        let mut c = self.tree.walk();
+        'outer: loop {
+            let n = c.node();
+            let (s, e) = (n.start_byte(), n.end_byte());
+            if s >= span.end {
+                break; // pre-order: nothing later starts earlier
+            }
+            let mut descend = false;
+            if e > span.start {
+                match classify(n) {
+                    Some(h) => out.push((s.max(span.start)..e.min(span.end), h)),
+                    None => descend = true,
+                }
+            }
+            if descend && c.goto_first_child() {
+                continue;
+            }
+            loop {
+                if c.goto_next_sibling() {
+                    continue 'outer;
+                }
+                if !c.goto_parent() {
+                    break 'outer;
+                }
+            }
+        }
+        out
+    }
+
+    /// Identity of the item whose bytes are exactly `span`.
+    pub fn item_at(&self, span: &Range<usize>) -> Option<ItemPath> {
+        let it = &self.syn.items;
+        let mut l = (0..it.kind.len()).find(|&l| it.bytes[l].range() == *span)?;
+        let mut path = ItemPath::new();
+        loop {
+            let same = |j: usize| it.parent[j] == it.parent[l] && it.kind[j] == it.kind[l] && it.name[j] == it.name[l];
+            let ordinal = (0..l).filter(|&j| same(j)).count() as u32;
+            path.push((it.kind[l], it.name[l].clone(), ordinal));
+            if it.parent[l] == LOCAL_NONE {
+                break;
+            }
+            l = it.parent[l] as usize;
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// Where the item with this identity is now.
+    pub fn find_item(&self, path: &ItemPath) -> Option<Range<usize>> {
+        let it = &self.syn.items;
+        let mut parent = LOCAL_NONE;
+        for (kind, name, ordinal) in path {
+            parent = (0..it.kind.len())
+                .filter(|&j| it.parent[j] == parent && it.kind[j] == *kind && it.name[j] == *name)
+                .nth(*ordinal as usize)? as u32;
+        }
+        (parent != LOCAL_NONE).then(|| it.bytes[parent as usize].range())
     }
 
     /// Replace `range` (bytes, on char boundaries) by `with` and reparse
@@ -145,6 +263,48 @@ mod tests {
         b.edit(at..at, "fn c() {\r\n    a()\r\n}\r\n");
         assert_same_as_fresh(&b);
         assert_eq!(b.syntax().items.name, ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn highlights_are_clipped_and_classified() {
+        let src = "// c\nfn alpha<'x>(v: &'x mut Foo) -> u32 { b::callee(1); v.meth(\"s\"); println!(\"{}\", 2) }\nfn z() {}\n";
+        let b = Buffer::new(src.to_string());
+        let end = src.find("fn z").unwrap();
+        let hl = b.highlights(5..end);
+        let of = |t: &str| {
+            let at = src.find(t).unwrap();
+            hl.iter().find(|(r, _)| *r == (at..at + t.len())).map(|(_, h)| *h)
+        };
+        assert_eq!(of("fn"), Some(Hl::Keyword));
+        assert_eq!(of("alpha"), Some(Hl::Function));
+        assert_eq!(of("'x"), Some(Hl::Lifetime));
+        assert_eq!(of("mut"), Some(Hl::Keyword));
+        assert_eq!(of("Foo"), Some(Hl::Type));
+        assert_eq!(of("u32"), Some(Hl::Type));
+        assert_eq!(of("callee"), Some(Hl::Function));
+        assert_eq!(of("meth"), Some(Hl::Function));
+        assert_eq!(of("\"s\""), Some(Hl::String));
+        assert_eq!(of("println"), Some(Hl::Macro));
+        assert_eq!(of("// c"), None, "outside the span");
+        assert!(hl.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        assert!(hl.iter().all(|(r, _)| r.start >= 5 && r.end <= end));
+        assert_eq!(b.highlights(0..4), [(0..4, Hl::Comment)]);
+    }
+
+    #[test]
+    fn item_paths_survive_moves() {
+        let a = Buffer::new("impl S { fn m() {} }\nimpl S { fn m() { 1 } }\nfn m() {}\n".to_string());
+        let span = a.text().find("fn m() { 1 }").unwrap();
+        let span = span..span + "fn m() { 1 }".len();
+        let path = a.item_at(&span).unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].2, 1, "second `impl S`");
+        // Same item after unrelated text moved and changed it.
+        let b =
+            Buffer::new("fn m() {}\n\nimpl S { fn m() {} }\nstruct S;\nimpl S {\n    fn m() { 2 }\n}\n".to_string());
+        assert_eq!(&b.text()[b.find_item(&path).unwrap()], "fn m() { 2 }");
+        assert_eq!(a.item_at(&(0..3)), None);
+        assert_eq!(Buffer::new("fn m() {}".to_string()).find_item(&path), None);
     }
 
     #[test]

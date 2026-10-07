@@ -5,7 +5,7 @@ use bevy::tasks::Task;
 use bevy_egui::egui;
 use pcg_core::{Graph, NodeId};
 use pcg_layout::Layout;
-use pcg_syntax::{Buffer, BuildStats, GraphDiff, ParseCache};
+use pcg_syntax::{Buffer, BuildStats, GraphDiff, ItemPath, ParseCache};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,36 +120,59 @@ impl Default for Selection {
     }
 }
 
-/// The in-node editor (at most one open at a time).
+/// Open files and the in-node editors looking into them.
 #[derive(Resource, Default)]
 pub struct Editing {
-    pub session: Option<EditSession>,
+    pub docs: Vec<Doc>,
+    /// Source of [`Editor::id`]s.
+    pub next_id: u64,
 }
 
-pub struct EditSession {
+/// A file open for editing.
+pub struct Doc {
     pub path: PathBuf,
-    /// Editor caption: the edited node, as last seen in a snapshot.
-    pub title: String,
     /// The whole file, with its syntax tree.
     pub buffer: Buffer,
     /// On-disk text the buffer started from / was last saved as (save guard).
     pub base: Arc<str>,
-    /// The edited node's bytes in `buffer`.
-    pub span: std::ops::Range<usize>,
-    /// `span`'s text as shown in the editor (LF line endings).
-    pub draft: String,
     pub crlf: bool,
     /// Buffer differs from `base`.
     pub dirty: bool,
-    /// The edited node in the current snapshot (`NONE` while it does not parse).
-    pub node: NodeId,
-    /// World rect the editor sits on (the node's, as last seen).
-    pub anchor: [f32; 4],
+    /// The file changed on disk under unsaved text.
+    pub conflict: bool,
     /// Time of the last keystroke (debounces the live rebuild).
     pub changed_at: f64,
     /// Buffer changed since the last rebuild was requested.
     pub graph_stale: bool,
+    /// Views into the buffer; their spans never overlap.
+    pub editors: Vec<Editor>,
+}
+
+/// One node's source, open on the canvas.
+pub struct Editor {
+    /// Stable id for egui state (focus, cursor, scroll).
+    pub id: u64,
+    /// Caption: the edited node, as last seen in a snapshot.
+    pub title: String,
+    /// The edited node's bytes in the doc's buffer.
+    pub span: std::ops::Range<usize>,
+    /// `span`'s text as shown in the editor (LF line endings).
+    pub draft: String,
+    /// `draft` as last applied to the buffer.
+    pub synced: String,
+    /// `synced`, syntax-highlighted.
+    pub job: egui::text::LayoutJob,
+    /// The edited item's identity in its file (to re-find it in new disk text).
+    pub item: ItemPath,
+    /// Editing the file module: the span is the whole file.
+    pub whole_file: bool,
+    /// The edited node in the current snapshot (`NONE` while it does not parse).
+    pub node: NodeId,
+    /// World rect the editor sits on (the node's, as last seen).
+    pub anchor: [f32; 4],
     pub want_focus: bool,
+    /// The text field had keyboard focus last frame.
+    pub focused: bool,
     /// Esc was pressed once on unsaved text.
     pub discard_armed: bool,
 }

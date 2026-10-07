@@ -25,7 +25,7 @@ pub fn build(
     let t = Instant::now();
     let name_len: Vec<u32> =
         (0..graph.nodes.len()).map(|i| graph.name(NodeId::from_idx(i)).chars().count() as u32).collect();
-    let layout = pcg_layout::layout(&graph.nodes, &name_len, &Default::default());
+    let layout = pcg_layout::layout(&graph.nodes, &name_len, &graph.edges.src, &graph.edges.dst, &Default::default());
     let t_layout = t.elapsed();
     let search_names = (0..graph.nodes.len()).map(|i| graph.name(NodeId::from_idx(i)).to_lowercase().into()).collect();
     let t = Instant::now();
@@ -51,7 +51,7 @@ pub fn start(
     let same_project = cache.root == path && project.data.is_some();
     if !same_project {
         *cache = Cache { root: path.clone(), ..default() };
-        editing.session = None;
+        editing.docs.clear();
     }
     let overlays = crate::edit::overlays(&editing);
     let prev = if same_project { project.data.clone() } else { None };
@@ -97,11 +97,9 @@ pub fn poll(
     sel.selected = selected;
     sel.hovered = NodeId::NONE;
     ui.search_for.clear(); // invalidate search hits (ids changed)
-    if let Some(s) = editing.session.as_mut()
-        && !crate::edit::rebind(s, &loaded)
-    {
-        editing.session = None;
-        ui.status += "\neditor closed: its file changed on disk";
+    let closed = crate::edit::rebind(&mut editing, &loaded);
+    if closed > 0 {
+        ui.status += &format!("\n{closed} editor(s) closed: their code is gone from disk");
     }
 
     if task.keep_view {
