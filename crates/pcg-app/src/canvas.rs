@@ -11,8 +11,7 @@ use crate::anim::Anim;
 use crate::model::*;
 use crate::theme::{self, smooth};
 use bevy_egui::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2,
-    epaint::CubicBezierShape,
+    self, Align2, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
 use pcg_core::{EdgeKind, Graph, NodeId, SummaryState};
 use pcg_layout::Layout;
@@ -472,21 +471,59 @@ fn ports(a: Rect, b: Rect) -> (Pos2, Vec2, Pos2, Vec2) {
     }
 }
 
-/// Point on the side of `r` that faces along `dir` (an axis unit vector).
-fn side(r: Rect, dir: Vec2) -> Pos2 {
-    r.center() + dir * r.size() * 0.5
+/// Outward normal of the side of `r` that `q` (a point on its border) lies on.
+fn normal(r: Rect, q: Pos2) -> Vec2 {
+    let d = [(q.x - r.min.x).abs(), (q.x - r.max.x).abs(), (q.y - r.min.y).abs(), (q.y - r.max.y).abs()];
+    let side = (0..4).min_by(|&a, &b| d[a].total_cmp(&d[b])).unwrap();
+    [-Vec2::X, Vec2::X, -Vec2::Y, Vec2::Y][side]
 }
 
-/// The path of the edge between drawn boxes `rs` → `rd`, as chained cubic
-/// beziers in screen space.
+/// Continue `path`, which ends on the border of `r`, to `q` on the same
+/// border — around the outside of the box, not through it.
+fn around(path: &mut Vec<Pos2>, r: Rect, q: Pos2, clearance: f32) {
+    let Some(&p) = path.last() else { return };
+    if p.distance(q) < 0.5 {
+        return;
+    }
+    let (np, nq) = (normal(r, p), normal(r, q));
+    let (p1, q1) = (p + np * clearance, q + nq * clearance);
+    path.push(p1);
+    if np == -nq {
+        // Opposite sides: pass the nearer of the two sides in between.
+        let out = r.expand(clearance);
+        if np.x != 0.0 {
+            let y = if (p.y - out.min.y) + (q.y - out.min.y) < (out.max.y - p.y) + (out.max.y - q.y) {
+                out.min.y
+            } else {
+                out.max.y
+            };
+            path.extend([Pos2::new(p1.x, y), Pos2::new(q1.x, y)]);
+        } else {
+            let x = if (p.x - out.min.x) + (q.x - out.min.x) < (out.max.x - p.x) + (out.max.x - q.x) {
+                out.min.x
+            } else {
+                out.max.x
+            };
+            path.extend([Pos2::new(x, p1.y), Pos2::new(x, q1.y)]);
+        }
+    } else if np != nq {
+        // Neighbouring sides: one corner.
+        path.push(if np.x != 0.0 { Pos2::new(p1.x, q1.y) } else { Pos2::new(q1.x, p1.y) });
+    }
+    path.push(q1);
+}
+
+/// The path of the edge between drawn boxes `rs` → `rd`, as a polyline in
+/// screen space.
 ///
-/// The edge is routed at the level where its ends part ways: `ta` / `tb` are
-/// the siblings (children of the lowest common ancestor) holding `rs` / `rd`.
-/// Between those two the layout's route is used if there is one (lanes between
-/// the boxes), else one curve between facing sides. An end that lies deeper
-/// first runs to that port on its container's side — so all edges between two
-/// containers share one bundle and only fan out inside them.
-fn edge_path(g: &Graph, view: &View, l: &Layout, anim: Option<&Anim>, rs: u32, rd: u32, out: &mut Vec<[Pos2; 4]>) {
+/// The edge is followed level by level: `ta` / `tb` are the siblings
+/// (children of the lowest common ancestor) holding `rs` / `rd`. From `rs`
+/// it takes each container's out-bus up to `ta`, the sibling route from `ta`
+/// to `tb`, and the in-buses down to `rd` — the layout's routes, which run
+/// between the boxes, and which all edges between two containers share.
+/// Where the layout has no route (shelf-packed containers, or boxes still
+/// moving), a curve between facing sides fills in.
+fn edge_path(g: &Graph, view: &View, l: &Layout, anim: Option<&Anim>, rs: u32, rd: u32, out: &mut Vec<Pos2>) {
     out.clear();
     let nodes = &g.nodes;
     let (mut ta, mut tb) = (rs as usize, rd as usize);
@@ -505,47 +542,116 @@ fn edge_path(g: &Graph, view: &View, l: &Layout, anim: Option<&Anim>, rs: u32, r
             tb = nodes.parent[tb].idx();
         }
     }
-    let (a, b) = (srect(view, l, anim, ta as u32), srect(view, l, anim, tb as u32));
-
-    // Knots: (point, direction of travel there).
-    let mut knots: Vec<(Pos2, Vec2)> = Vec::with_capacity(8);
     // Routes belong to the final layout: not while boxes are still gliding to it.
     let settled = anim.is_none_or(|a| a.k >= 1.0);
-    let route = l.routes.get(NodeId::from_idx(ta), NodeId::from_idx(tb)).filter(|_| settled);
-    let (out_dir, in_dir) = if let Some(route) = route {
-        let pt = |q: &[f32; 2]| view.w2s(Pos2::new(q[0], q[1]));
-        let (first, last) = (pt(&route[0]), pt(&route[route.len() - 1]));
-        let d0 = if first.x >= a.center().x { Vec2::X } else { -Vec2::X };
-        let d3 = if last.x >= b.center().x { -Vec2::X } else { Vec2::X };
-        knots.push((side(a, d0), d0));
-        // Lanes are straight and horizontal; the hops between them S-curves.
-        let mut dir = d0;
-        for (i, q) in route.iter().map(pt).enumerate() {
-            if i % 2 == 0 {
-                dir = if route[i + 1][0] >= route[i][0] { Vec2::X } else { -Vec2::X };
-            }
-            knots.push((q, dir));
-        }
-        knots.push((side(b, -d3), d3));
-        (d0, d3)
-    } else {
-        let (p0, d0, p3, d3) = ports(a, b);
-        knots.push((p0, d0));
-        knots.push((p3, -d3));
-        (d0, -d3)
+    let route = |a: usize, b: usize| l.routes.get(NodeId::from_idx(a), NodeId::from_idx(b)).filter(|_| settled);
+    let screen = |q: &[f32; 2]| view.w2s(Pos2::new(q[0], q[1]));
+    let rect = |n: usize| srect(view, l, anim, n as u32);
+    let clearance = (3.0 * view.zoom).clamp(1.5, 12.0);
+    // Append a route that starts on the border of `at`, where `out` has arrived.
+    let follow = |out: &mut Vec<Pos2>, at: usize, r: &[[f32; 2]]| {
+        around(out, rect(at), screen(&r[0]), clearance);
+        out.extend(r.iter().map(screen));
     };
-    // Ends nested inside the routed siblings join the bundle at its port.
-    if ta as u32 != rs {
-        knots.insert(0, (side(srect(view, l, anim, rs), out_dir), out_dir));
+
+    // Up: out-buses from `rs` to `ta`. A level without a route ends the
+    // chain; the edge then jumps to the next piece.
+    let mut n = rs as usize;
+    while n != ta {
+        let parent = nodes.parent[n].idx();
+        let Some(r) = route(n, parent) else { break };
+        follow(out, n, r);
+        n = parent;
     }
-    if tb as u32 != rd {
-        knots.push((side(srect(view, l, anim, rd), -in_dir), in_dir));
+    let up_done = n == ta;
+    // Down, collected bottom-up: in-buses from `tb` to `rd`.
+    let mut down: Vec<(usize, &[[f32; 2]])> = Vec::new();
+    let mut n = rd as usize;
+    while n != tb {
+        let parent = nodes.parent[n].idx();
+        let Some(r) = route(parent, n) else { break };
+        down.push((parent, r));
+        n = parent;
     }
-    for w in knots.windows(2) {
-        let ((p, dp), (q, dq)) = (w[0], w[1]);
-        let reach = ((q - p).length() * 0.4).clamp(4.0, 160.0);
-        out.push([p, p + dp * reach, q - dq * reach, q]);
+    let down_done = n == tb;
+
+    // Across: `ta` → `tb`.
+    let (a, b) = (rect(ta), rect(tb));
+    match route(ta, tb) {
+        Some(r) if up_done || out.is_empty() => {
+            if out.is_empty() && ta as u32 != rs {
+                out.push(side(rect(rs as usize), normal(a, screen(&r[0]))));
+            }
+            follow(out, ta, r);
+        }
+        Some(r) => out.extend(r.iter().map(screen)),
+        None => {
+            let (p0, d0, p3, d3) = ports(a, b);
+            if out.is_empty() && ta as u32 != rs {
+                out.push(side(rect(rs as usize), d0));
+            }
+            let reach = ((p3 - p0).length() * 0.4).clamp(4.0, 160.0);
+            let curve = [p0, p0 + d0 * reach, p3 + d3 * reach, p3];
+            out.extend((0..=16).map(|i| bez_point(&curve, i as f32 / 16.0)));
+        }
     }
+    if down_done {
+        for &(at, r) in down.iter().rev() {
+            follow(out, at, r);
+        }
+    } else if let Some(&last) = out.last() {
+        // Enter `rd` on the side the edge comes from.
+        let r = rect(rd as usize);
+        let to = r.center() - last;
+        let d = if to.x.abs() * r.height() > to.y.abs() * r.width() {
+            Vec2::new(to.x.signum(), 0.0)
+        } else {
+            Vec2::new(0.0, to.y.signum())
+        };
+        out.push(side(r, -d));
+    }
+    out.dedup_by(|a, b| a.distance(*b) < 0.25);
+}
+
+/// Point on the side of `r` that faces along `dir` (an axis unit vector).
+fn side(r: Rect, dir: Vec2) -> Pos2 {
+    r.center() + dir * r.size() * 0.5
+}
+
+/// `path` with its corners rounded off (radius at most `radius`).
+fn rounded(path: &[Pos2], radius: f32, out: &mut Vec<Pos2>) {
+    out.clear();
+    for (i, &p) in path.iter().enumerate() {
+        if i == 0 || i + 1 == path.len() {
+            out.push(p);
+            continue;
+        }
+        let (a, b) = (path[i - 1] - p, path[i + 1] - p);
+        let r = radius.min(a.length() * 0.5).min(b.length() * 0.5);
+        if r < 0.75 {
+            out.push(p);
+            continue;
+        }
+        let (p0, p2) = (p + a.normalized() * r, p + b.normalized() * r);
+        // Quadratic bezier p0 → p → p2.
+        out.extend((0..=4).map(|k| {
+            let t = k as f32 / 4.0;
+            let (u, v) = (p0 + (p - p0) * t, p + (p2 - p) * t);
+            u + (v - u) * t
+        }));
+    }
+}
+
+/// Point at arc length `at` along `path`.
+fn along_path(path: &[Pos2], mut at: f32) -> Pos2 {
+    for w in path.windows(2) {
+        let len = w[0].distance(w[1]);
+        if at <= len && len > 0.0 {
+            return w[0] + (w[1] - w[0]) * (at / len);
+        }
+        at -= len;
+    }
+    path[path.len() - 1]
 }
 
 fn bez_point(p: &[Pos2; 4], t: f32) -> Pos2 {
@@ -573,7 +679,8 @@ fn draw_focus_edges(
     let range = sel.0..g.nodes.subtree_end[sel.idx()].0;
     let mut seen = rustc_hash::FxHashSet::<(u32, u32, bool)>::default();
     let mut budget = 3000usize;
-    let mut path: Vec<[Pos2; 4]> = Vec::new();
+    let mut path: Vec<Pos2> = Vec::new();
+    let mut smooth_path: Vec<Pos2> = Vec::new();
     for n in range.clone() {
         let lists = [(g.edges.out.of(NodeId(n)), true), (g.edges.inc.of(NodeId(n)), false)];
         for (list, outgoing) in lists {
@@ -603,25 +710,19 @@ fn draw_focus_edges(
                     (_, false) => theme::EDGE_IN,
                 };
                 edge_path(g, view, l, anim, rs, rd, &mut path);
-                let w = 1.2 + (g.edges.weight[e.idx()] as f32).log2().max(0.0) * 0.6;
-                let mut len = 0.0;
-                for &pts in &path {
-                    len += pts[0].distance(pts[3]);
-                    painter.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
-                        pts,
-                        false,
-                        Color32::TRANSPARENT,
-                        Stroke::new(w, color.gamma_multiply(0.75)),
-                    )));
+                if path.len() < 2 {
+                    continue;
                 }
+                rounded(&path, 7.0, &mut smooth_path);
+                let w = 1.2 + (g.edges.weight[e.idx()] as f32).log2().max(0.0) * 0.6;
+                painter.add(Shape::line(smooth_path.clone(), Stroke::new(w, color.gamma_multiply(0.75))));
                 // Flow dots, src → dst.
-                let len = len.max(1.0);
-                let dots = ((len / 60.0) as usize).clamp(1, 12);
+                let len: f32 = smooth_path.windows(2).map(|s| s[0].distance(s[1])).sum::<f32>().max(1.0);
+                let dots = ((len / 60.0) as usize).clamp(1, 24);
                 let phase = (now as f32 * 120.0 / len).fract();
                 for k in 0..dots {
-                    let t = (phase + k as f32 / dots as f32).fract() * path.len() as f32;
-                    let seg = (t as usize).min(path.len() - 1);
-                    painter.circle_filled(bez_point(&path[seg], t - seg as f32), w + 1.0, color);
+                    let t = (phase + k as f32 / dots as f32).fract();
+                    painter.circle_filled(along_path(&smooth_path, t * len), w + 1.0, color);
                 }
                 budget = budget.saturating_sub(1);
                 if budget == 0 {
