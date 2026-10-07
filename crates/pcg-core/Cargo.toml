@@ -1,0 +1,9 @@
+[package]
+name = "pcg-core"
+description = "Data model of the pcg IDE: dense ids, string interner and SoA graph tables. No logic beyond accessors."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true

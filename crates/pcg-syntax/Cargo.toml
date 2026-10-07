@@ -1,0 +1,15 @@
+[package]
+name = "pcg-syntax"
+description = "tree-sitter stage: scan + parallel parse of Rust sources into pcg-core graph tables; @pcg comments; subtree hashing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcg-core.workspace = true
+rustc-hash.workspace = true
+rayon.workspace = true
+walkdir.workspace = true
+xxhash-rust.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "pcg-layout"
+description = "Hierarchical nested-box layout over the pcg-core node table (SoA, non-recursive)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcg-core.workspace = true

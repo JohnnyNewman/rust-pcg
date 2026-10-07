@@ -1,0 +1,18 @@
+[package]
+name = "pcg-app"
+description = "The pcg IDE: Bevy shell (scheduling, input, rendering) + bevy_egui panels over the headless core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pcg"
+path = "src/main.rs"
+
+[dependencies]
+pcg-core.workspace = true
+pcg-syntax.workspace = true
+pcg-layout.workspace = true
+bevy.workspace = true
+bevy_egui.workspace = true
+rustc-hash.workspace = true
