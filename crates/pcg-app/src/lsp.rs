@@ -3,7 +3,8 @@
 //! One worker thread per project owns the language-server client. Whenever
 //! the current snapshot contains text the server has not been asked about,
 //! [`drive`] hands the snapshot to the worker; the worker resolves every call
-//! site ([`pcg_lsp::resolve`]) and sends the answers back, which triggers a
+//! site — after an edit, only those whose answer may have changed
+//! ([`pcg_lsp::resolve`]) — and sends the answers back, which triggers a
 //! rebuild that uses them. Until then — and for whatever the server cannot
 //! answer — the graph shows the name-based edges.
 
@@ -40,12 +41,15 @@ fn worker(root: std::path::PathBuf, jobs: Receiver<Arc<Loaded>>, events: Sender<
         return;
     }
     say("rust-analyzer: ready");
+    // Answers for the last snapshot: the next one only asks what may have changed.
+    let mut last: Option<Precise> = None;
     while let Ok(job) = jobs.recv() {
         let mut progress = |done: usize, total: usize| {
             say(&format!("rust-analyzer: resolving calls {done}/{total}"));
         };
-        match pcg_lsp::resolve(&mut client, &job.graph, &mut progress) {
-            Ok(p) => {
+        match pcg_lsp::resolve(&mut client, &job.graph, last.as_ref(), &mut progress) {
+            Ok((p, _)) => {
+                last = Some(p.clone());
                 if events.send(Event::Done(p)).is_err() {
                     return;
                 }
