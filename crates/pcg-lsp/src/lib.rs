@@ -8,7 +8,8 @@
 //!
 //! The server is given every file's text as the snapshot has it (`didOpen` /
 //! `didChange`), so byte offsets on both sides refer to the same text — also
-//! for unsaved editor buffers.
+//! for unsaved editor buffers. After an edit only the call sites whose answer
+//! may have changed are asked again ([`plan`]).
 //!
 //! rust-analyzer is started with build scripts, proc macros and `cargo check`
 //! switched off: it then never runs cargo builds in the project's target
@@ -302,39 +303,83 @@ fn first_location(result: &Value) -> Option<(&str, usize, usize)> {
     Some((uri.as_str()?, pos["line"].as_u64()? as usize, pos["character"].as_u64()? as usize))
 }
 
-/// Ask the server for the definition behind every call site of `g`.
+/// What a new snapshot needs from the server, given the answers `prev` for
+/// an earlier one: the answers that still hold, and the call sites to ask.
+///
+/// An answer holds if neither its file nor the file it points into changed.
+/// More cautiously, a file is asked again as a whole if it changed *or
+/// depends on a changed file* (has an answer pointing into one): what a call
+/// resolves to can hinge on the types other calls in that file return. Sites
+/// the server had no answer for are always asked again — the definition may
+/// have appeared since.
+fn plan(g: &Graph, prev: Option<&Precise>) -> (Precise, Vec<usize>) {
+    let mut keep = Precise::default();
+    for f in 0..g.files.len() {
+        keep.files.insert(g.files.path[f].clone(), text_hash(&g.files.source[f]));
+    }
+    let Some(prev) = prev else { return (keep, (0..g.calls.len()).collect()) };
+    let same = |path: &PathBuf| prev.files.get(path).is_some_and(|h| keep.files.get(path) == Some(h));
+    let again: Vec<bool> = (0..g.files.len())
+        .map(|f| {
+            let path = &g.files.path[f];
+            !same(path) || prev.sites.get(path).is_some_and(|m| m.values().flatten().any(|(to, _)| !same(to)))
+        })
+        .collect();
+    for f in (0..g.files.len()).filter(|&f| !again[f]) {
+        if let Some(m) = prev.sites.get(&g.files.path[f]) {
+            keep.sites.insert(g.files.path[f].clone(), m.clone());
+        }
+    }
+    let ask = (0..g.calls.len())
+        .filter(|&s| {
+            let f = g.nodes.file[g.calls.caller[s].idx()].idx();
+            again[f] || !keep.sites.get(&g.files.path[f]).is_some_and(|m| m.contains_key(&g.calls.at[s]))
+        })
+        .collect();
+    (keep, ask)
+}
+
+/// Ask the server for the definition behind the call sites of `g` — all of
+/// them, or with `prev` (the result for an earlier snapshot) only those whose
+/// answer may have changed (see [`plan`]). Returns the answers for `g` and how
+/// many sites were asked.
 ///
 /// `progress(done, total)` is called now and then. Sites the server gives no
 /// answer for are left out of the result (the build keeps its own guess for
 /// them); a definition in a file that is not part of the graph is recorded as
 /// "outside the workspace".
-pub fn resolve(c: &mut Client, g: &Graph, progress: &mut dyn FnMut(usize, usize)) -> io::Result<Precise> {
-    let mut precise = Precise::default();
+pub fn resolve(
+    c: &mut Client,
+    g: &Graph,
+    prev: Option<&Precise>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> io::Result<(Precise, usize)> {
+    let (mut precise, ask) = plan(g, prev);
     let mut by_norm: FxHashMap<String, FileId> = FxHashMap::default();
     for f in 0..g.files.len() {
         let path = &g.files.path[f];
         c.sync(path, &g.files.source[f])?;
-        precise.files.insert(path.clone(), text_hash(&g.files.source[f]));
         by_norm.insert(norm(path), FileId::from_idx(f));
     }
     let starts: Vec<Vec<u32>> = g.files.source.iter().map(|s| line_starts(s)).collect();
     let uris: Vec<String> = g.files.path.iter().map(|p| to_uri(p)).collect();
 
-    let total = g.calls.len();
+    let total = ask.len();
     // Request id → call site.
     let mut pending: FxHashMap<i64, usize> = FxHashMap::default();
     let (mut next, mut done) = (0usize, 0usize);
     while done < total {
         while next < total && pending.len() < WINDOW {
-            let f = g.nodes.file[g.calls.caller[next].idx()].idx();
-            let at = g.calls.at[next] as usize;
+            let site = ask[next];
+            let f = g.nodes.file[g.calls.caller[site].idx()].idx();
+            let at = g.calls.at[site] as usize;
             let line = starts[f].partition_point(|&s| s as usize <= at) - 1;
             let character = column(&g.files.source[f][starts[f][line] as usize..at], c.utf8);
             let id = c.request(
                 "textDocument/definition",
                 json!({ "textDocument": { "uri": uris[f] }, "position": { "line": line, "character": character } }),
             )?;
-            pending.insert(id, next);
+            pending.insert(id, site);
             next += 1;
         }
         let Some((id, msg)) = c.next(Duration::from_secs(120))? else { continue };
@@ -351,7 +396,7 @@ pub fn resolve(c: &mut Client, g: &Graph, progress: &mut dyn FnMut(usize, usize)
         let file = g.nodes.file[g.calls.caller[site].idx()];
         precise.sites.entry(g.files.path[file.idx()].clone()).or_default().insert(g.calls.at[site], target);
     }
-    Ok(precise)
+    Ok((precise, total))
 }
 
 #[cfg(test)]
