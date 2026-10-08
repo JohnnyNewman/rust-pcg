@@ -5,9 +5,11 @@ A visual IDE (Blueprint-like, but for general-purpose code) written in Rust with
 is a projection of it. See the project docs (*vision-and-decisions*,
 *roadmap-and-architecture*) for the full design.
 
-**Status: M1 (skeleton & static graph), M2 (incremental reload, animated diff),
-M3 (in-node editing), the layered layout with edge routing, and M6 (precise call
-edges from rust-analyzer) implemented.**
+**Status: M1 (skeleton & static graph), M2 (incremental reload, animated diff,
+layered layout with edge routing, fold/unfold, focus mode, view-state sidecar) and
+M3 (in-node editing) implemented, plus one item pulled forward from M6: precise call
+edges from rust-analyzer. M4 (LLM integration) and M5 (visual debugging) have not
+been started.**
 
 ![Focus on a function: callers (orange) and callees (blue) with flowing dots](docs/screenshots/focus-edges.png)
 
@@ -36,7 +38,9 @@ rust-analyzer`); without it, or with `--no-lsp`, edges are name-based.
 | drag | pan |
 | click | select · `Esc` deselect · `Backspace` select parent |
 | double-click / `F` | fly to node (`F` with nothing selected: fit all) |
-| search box | find by name, click to fly there |
+| search box | find by name, click to fly there (opens whatever is folded around it) |
+| `C` / inspector → *Fold* | fold the selected container into one box, or unfold it; its edges then end on the box. *unfold all* in the top bar |
+| `Shift+F` / *focus* | focus mode on the selection: containers holding nothing it calls or is called by are folded, the other bystanders dimmed. Again (or with nothing selected) to leave. `C` still opens a folded box |
 | *code face / summary face* | what leaves show at deep zoom |
 | *all edges* | aggregated call graph on the visible boxes |
 | `Enter` / inspector → *Edit* | edit the selected node's source in place, syntax-highlighted; any number of editors can be open, also several on one file. The graph follows the unsaved text live (calls, new items, the diff animation); nothing touches the disk until `Ctrl+S` (all files) / *Save*. `Esc` closes the focused editor (asks once before discarding unsaved text). If a file changes on disk under unsaved text, its editors offer *Keep mine* / *Take theirs*. |
@@ -51,7 +55,8 @@ crates/
   pcg-syntax/  stages: scan → parse (rayon, tree-sitter) → assemble → @pcg comments → resolve edges;
                `Buffer` = an open file (text + syntax tree, edit-range reparse)
   pcg-layout/  nested boxes, two linear passes; per container a layered (call-flow) or shelf
-               arrangement, plus a route for every edge between or through containers
+               arrangement, plus a route for every edge between or through containers;
+               folded containers, and hints from the previous layout to stay put
   pcg-lsp/     rust-analyzer client: where is each call site's callee defined?
   pcg-app/     Bevy shell + egui panels/canvas; resources = data, systems = control flow
 ```
@@ -108,14 +113,47 @@ caller of fifty) or too big.
 
 Every such edge gets a route: an orthogonal polyline through the gutters between
 layers, along the lanes, and around the band ends — between the boxes, never across
-them. Edges that leave or enter a container are collected on a bus (one lane per
+them. Edges that jog in the same gutter get a track each, ordered so they nest
+instead of crossing. Shelf-packed containers route through the gaps between their
+rows and around their padding, to ports on their left and right side. Edges that leave or enter a container are collected on a bus (one lane per
 layer) ending in a port on the container's side, where the route one level up takes
 over. So an edge between two distant functions is drawn level by level — out of its
 module, across the crate, into the other module — and shares each stretch with every
-other edge going the same way.
+other edge going the same way. On screen a shared stretch is fanned out into parallel
+lines, one per edge, so a bundle is as wide as it is busy.
 
-This repo: 0.4 ms, root box 1.7:1 (plain layering: 4:1). `~/.cargo/registry/src`
-(1.5 M nodes, 840 k edges): 540 ms, 219 k routes; the shelf pass alone is 41 ms.
+This repo: 0.6 ms, root box 1.6:1 (plain layering: 4:1). `~/.cargo/registry/src`
+(1.5 M nodes, 840 k edges): 800 ms, 618 k routes; the shelf pass alone is 41 ms.
+(Measured before folding and the hints below were added.)
+
+### Folding, focus, and staying put
+
+View state is not code, so it is not in the source files: which containers are
+folded, what the view is focused on, where the camera is. Folds are a set of stable
+node keys, turned into a per-node column for the layout. A folded container is sized
+like a leaf; everything inside gets an empty rect in its centre (and is culled like
+anything too small), and edges of hidden nodes are lifted onto the box, so they are
+routed and bundled like any other. Changing a fold does not touch the pipeline: the
+new snapshot shares the graph and only the layout runs again, and the canvas glides
+from the old layout to the new one — children shrink into a closing box and fade,
+and grow out of an opening one. The camera moves along with the selection, so what
+you are looking at stays under your eyes.
+
+Focus mode is the same mechanism with a computed set: keep the focused node, what
+is inside it, its callers and callees, and the ancestors of all these; fold every
+other container and dim the remaining bystanders.
+
+Every layout is told where things were in the one before (matched by stable key):
+sub-modules keep their order although their sizes changed (from scratch they are
+sorted tallest first, so a module that grows would jump the queue), and a layered
+container keeps its axis and its band wrap unless another choice has become clearly
+better. A call chain growing one function at a time changes its best arrangement
+5 times between 6 and 30 functions; with the hint, 2 of those rearrangements do not
+happen (the others are large improvements in shape).
+
+The folded set and the camera persist in `<project>/.pcg/view.json`. The file is
+first written when you fold something — only looking at a project leaves nothing
+behind — and from then on follows the folds and the camera. Focus is per session.
 
 ### Precise call edges (rust-analyzer)
 
@@ -129,6 +167,8 @@ keep the name-based guess; the side panel shows how many were resolved.
 The server is given every file's text exactly as the snapshot has it — including
 unsaved editor buffers — and answers are only applied to text with the same hash, so
 an edit falls back to the guess for that file until the server has been asked again.
+After an edit only the affected call sites are asked: those in changed files, in
+files that call into a changed file, and those that had no answer before.
 It runs with build scripts, proc macros and `cargo check` off: it never builds in
 your target directory, and does not see through generated code.
 
@@ -170,22 +210,34 @@ draws only ~1–5 k boxes per frame.
   it sees: with proc macros and build scripts off, calls on types that come out of
   generated code may stay unanswered. Until then, and for those, edges are name-based
   heuristics (free fn / method / `Type::f` / macro, ranked same-file → same-crate →
-  global, ambiguous calls dropped, common std method names skipped). Every edit
-  re-asks all call sites, not just the changed file's. Calls through a generic bound
+  global, ambiguous calls dropped, common std method names skipped). A change that
+  alters what an *unchanged* file's calls resolve to without that file calling into
+  the changed one (a new glob import target, say) is not noticed until that file is
+  touched. Calls through a generic bound
   or trait object point at the trait's declaration, not at the impls. Calls inside macro arguments
   (`println!(…f()…)`) are not seen by tree-sitter at all.
 * Syntax trees are dropped after extraction (memory), except for the file open in the
   editor. External saves reload per *file* (a parse cache keyed by mtime/size/bytes):
   they give no edit ranges for tree-sitter.
-* In-node editing: no completion, no three-way merge (a conflict is all-mine or
+* In-node editing: undo/redo is only egui's per-text-field history (lost when an
+  editor closes; the roadmap's M3 asks for more); `@pcg` comments are shown as plain
+  text, not folded; no completion, no three-way merge (a conflict is all-mine or
   all-theirs), editors of one file may not overlap. Extraction after an edit re-walks
   the whole file, and the live rebuild re-runs assemble + resolve over the whole project.
 * Stable node identity is `(parent, kind, name, ordinal)`: renaming an item, or moving
   it to another module, reads as exit + enter, not as a move.
-* Layout: a call-graph change can reshuffle a container; layers are centred in their
-  band, not aligned to straighten edges; wrapped layouts leave empty corners. Edges
-  sharing a gutter or bus are drawn on top of each other (one line, many dots). Where
-  a container's layers and its parent's run along different axes, the edge walks
-  around the container's corner. Shelf-packed containers have no routes: edges cross
-  them as plain curves. The "all edges" overlay draws straight lines.
+* Layout: a new or removed call can still reshuffle a container — which layer a
+  function sits in, and the order within a layer, are computed afresh; only the
+  order of sub-modules, the axis and the wrap are held. Positions are not persisted,
+  so the first layout after a restart is the from-scratch one. Layers are centred in
+  their band, not aligned to straighten edges; wrapped layouts leave empty corners.
+  Where a
+  container's layers and its parent's run along different axes, the edge walks around
+  the container's corner. Wide bundles are squeezed into their lane, so beyond a handful
+  of edges the parallel lines merge into a band. The "all edges" overlay draws
+  straight lines.
+* Folding: an editor open on a node that gets folded away stays open, floating over
+  the folded box. A fold is keyed like every node (`parent, kind, name, ordinal`):
+  rename a folded module and it comes back open. Focus mode follows call edges one
+  step, in both directions; there is no depth setting.
 * Rendering uses egui's painter; GPU instancing / custom WGSL comes with M5.

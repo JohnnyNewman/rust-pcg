@@ -10,11 +10,12 @@
 //! | `watch::poll`     | Update                 | `Watch` → `LoadRequest` (debounced)     |
 //! | `edit::poll`      | Update                 | `Editing` → `LoadRequest` (debounced live rebuild) |
 //! | `lsp::drive`      | Update                 | `Project`, worker thread ⇄ `Lsp` → `LoadRequest` (answers arrived) |
-//! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay), `Lsp` (answers) → `LoadTask` |
+//! | `viewstate::poll` | Update                 | `ViewState`, `View` → `LoadRequest` (relayout), the sidecar file |
+//! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay), `Lsp` (answers), `ViewState` → `LoadTask` |
 //! | `load::poll`      | Update                 | `LoadTask` → `Project`, `Transition`, `View`, `Selection`, `Watch`, `Editing` |
 //! | `anim::end`       | Update                 | `Time` → `Transition` (drops old snapshot) |
 //! | `view::animate`   | Update                 | `Time` → `View`                         |
-//! | `ui::ui`          | EguiPrimaryContextPass | everything → `View`, `Selection`, `UiState`, `Editing`, `LoadRequest` |
+//! | `ui::ui`          | EguiPrimaryContextPass | everything → `View`, `Selection`, `UiState`, `Editing`, `ViewState`, `LoadRequest` |
 
 mod anim;
 mod canvas;
@@ -25,6 +26,7 @@ mod model;
 mod theme;
 mod ui;
 mod view;
+mod viewstate;
 mod watch;
 
 use bevy::prelude::*;
@@ -48,7 +50,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(EguiPlugin::default())
-        .insert_resource(LoadRequest { path: path.clone(), pending: true, keep_view: false })
+        .insert_resource(LoadRequest { path: path.clone(), pending: true, keep_view: false, relayout: false })
         .insert_resource(UiState { path_input: path.display().to_string(), ..default() })
         .init_resource::<Project>()
         .init_resource::<LoadTask>()
@@ -59,11 +61,13 @@ fn main() {
         .init_resource::<Cache>()
         .init_resource::<Watch>()
         .init_resource::<Editing>()
+        .init_resource::<ViewState>()
         .insert_resource(Lsp { enabled: !no_lsp, ..default() })
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (watch::poll, edit::poll, lsp::drive, load::start, load::poll, anim::end, view::animate).chain(),
+            (watch::poll, edit::poll, lsp::drive, viewstate::poll, load::start, load::poll, anim::end, view::animate)
+                .chain(),
         )
         .add_systems(EguiPrimaryContextPass, ui::ui)
         .run();

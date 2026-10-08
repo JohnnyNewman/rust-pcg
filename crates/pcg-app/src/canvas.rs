@@ -6,6 +6,10 @@
 //! project size. Semantic zoom is continuous: a container's children fade in as
 //! its on-screen width crosses [`CHILD_LOD`], so zooming itself animates the
 //! level-of-detail transition.
+//!
+//! Closed containers (view state) are drawn as one solid box; what is inside
+//! has an empty rect and is culled like anything too small. In focus mode the
+//! nodes outside the focus' neighbourhood are dimmed.
 
 use crate::anim::Anim;
 use crate::model::*;
@@ -20,6 +24,10 @@ use pcg_layout::Layout;
 const CHILD_LOD: (f32, f32) = (70.0, 150.0);
 /// Smallest box drawn at all.
 const MIN_PX: f32 = 4.0;
+/// Opacity left to nodes outside the focus.
+const DIMMED: f32 = 0.3;
+/// Cap for the edges of the selection.
+const MAX_FOCUS_EDGES: usize = 3000;
 /// Cap for the "all edges" overlay.
 const MAX_OVERVIEW_EDGES: usize = 40_000;
 
@@ -110,13 +118,20 @@ pub fn canvas(
         scratch.drawn += 1;
         scratch.rep[i] = i as u32;
         let has_children = end > i + 1;
-        let show_children = smooth(CHILD_LOD.0, CHILD_LOD.1, r.width());
+        // A closed container shows no children — except on its way there.
+        let closed = l.collapsed[i];
+        let open = if closed { anim.map_or(0.0, |a| a.folding(i)) } else { 1.0 };
+        let show_children = smooth(CHILD_LOD.0, CHILD_LOD.1, r.width()) * open;
         scratch.child_alpha[i] = alpha * show_children;
         let id = NodeId::from_idx(i);
         let r = r.translate(Vec2::new(0.0, (1.0 - appear) * 10.0));
+        // Outside the focus: there, but out of the way.
+        let dim_now = p.dim.get(i) == Some(&true);
+        let dim = anim.map_or(dim_now as u8 as f32, |a| a.dim(i, dim_now));
+        let own = alpha * (1.0 - (1.0 - DIMMED) * dim);
 
         let mut tab = 0.0;
-        draw_node(&painter, g, id, r, alpha, has_children, show_children, st.face, view.zoom, &mut tab);
+        draw_node(&painter, g, id, r, own, has_children, show_children, closed, st.face, view.zoom, &mut tab);
         if tab > 0.01 {
             tabs.push((r, id, tab));
         }
@@ -263,6 +278,7 @@ fn draw_node(
     alpha: f32,
     has_children: bool,
     show_children: f32,
+    closed: bool,
     face: Face,
     zoom: f32,
     tab: &mut f32,
@@ -272,6 +288,20 @@ fn draw_node(
     let kc = theme::kind(kind);
     let radius = CornerRadius::same(if r.width() > 40.0 { 5 } else { 2 });
     let expanded = has_children && show_children > 0.0;
+    // Closed by the user: a stack of cards — there is more underneath.
+    if closed && r.width() > 24.0 {
+        let a = alpha * (1.0 - show_children);
+        for k in [2.0, 1.0] {
+            let d = (k * 2.0 * zoom).clamp(k, k * 3.0);
+            painter.rect_stroke(
+                r.translate(Vec2::splat(d)),
+                radius,
+                Stroke::new(1.0, kc.gamma_multiply(0.45 * a / k)),
+                StrokeKind::Inside,
+            );
+        }
+        painter.rect_filled(r, radius, theme::BG.gamma_multiply(a));
+    }
 
     // Collapsed containers look "solid"; expanded ones become frames.
     let fill_a = if has_children { 0.05 + 0.20 * (1.0 - show_children) } else { 0.16 };
@@ -350,6 +380,17 @@ fn draw_node(
     }
     if g.nodes.intent[i].is_some() {
         painter.circle_stroke(Pos2::new(bx, by), 3.5, Stroke::new(1.5, theme::INTENT.gamma_multiply(label_a)));
+    }
+
+    // What a closed container holds.
+    if closed && r.height() - header.height() > font_px * 0.9 {
+        painter.with_clip_rect(r.shrink(2.0).intersect(painter.clip_rect())).text(
+            Pos2::new(r.min.x + 6.0, header.max.y),
+            Align2::LEFT_TOP,
+            format!("{} items inside", g.nodes.descendants(id).len()),
+            FontId::proportional(font_px * 0.8),
+            theme::TEXT_DIM.gamma_multiply(label_a * (1.0 - show_children)),
+        );
     }
 
     // Deep zoom: code or summary face inside leaves.
@@ -548,67 +589,83 @@ fn edge_path(g: &Graph, view: &View, l: &Layout, anim: Option<&Anim>, rs: u32, r
     let screen = |q: &[f32; 2]| view.w2s(Pos2::new(q[0], q[1]));
     let rect = |n: usize| srect(view, l, anim, n as u32);
     let clearance = (3.0 * view.zoom).clamp(1.5, 12.0);
-    // Append a route that starts on the border of `at`, where `out` has arrived.
-    let follow = |out: &mut Vec<Pos2>, at: usize, r: &[[f32; 2]]| {
-        around(out, rect(at), screen(&r[0]), clearance);
+    // Add a piece of the path. `at`: the box whose border the piece starts
+    // on, if the path so far ends on that border too — then the two are
+    // joined around the outside of the box. Otherwise the path just jumps.
+    let add = |out: &mut Vec<Pos2>, at: Option<usize>, r: &[[f32; 2]]| {
+        if let Some(at) = at {
+            around(out, rect(at), screen(&r[0]), clearance);
+        }
         out.extend(r.iter().map(screen));
     };
 
-    // Up: out-buses from `rs` to `ta`. A level without a route ends the
-    // chain; the edge then jumps to the next piece.
+    // Up: out-buses from `rs` to `ta`. A level without a route (a container
+    // the layout did not route) leaves a jump.
+    let mut joined = true;
     let mut n = rs as usize;
     while n != ta {
         let parent = nodes.parent[n].idx();
-        let Some(r) = route(n, parent) else { break };
-        follow(out, n, r);
+        match route(n, parent) {
+            Some(r) => {
+                add(out, joined.then_some(n), r);
+                joined = true;
+            }
+            None => joined = false,
+        }
         n = parent;
     }
-    let up_done = n == ta;
-    // Down, collected bottom-up: in-buses from `tb` to `rd`.
-    let mut down: Vec<(usize, &[[f32; 2]])> = Vec::new();
-    let mut n = rd as usize;
-    while n != tb {
-        let parent = nodes.parent[n].idx();
-        let Some(r) = route(parent, n) else { break };
-        down.push((parent, r));
-        n = parent;
-    }
-    let down_done = n == tb;
+    let started_at_rs = ta as u32 == rs || route(rs as usize, nodes.parent[rs as usize].idx()).is_some();
 
     // Across: `ta` → `tb`.
-    let (a, b) = (rect(ta), rect(tb));
     match route(ta, tb) {
-        Some(r) if up_done || out.is_empty() => {
-            if out.is_empty() && ta as u32 != rs {
-                out.push(side(rect(rs as usize), normal(a, screen(&r[0]))));
-            }
-            follow(out, ta, r);
-        }
-        Some(r) => out.extend(r.iter().map(screen)),
+        Some(r) => add(out, joined.then_some(ta), r),
         None => {
-            let (p0, d0, p3, d3) = ports(a, b);
-            if out.is_empty() && ta as u32 != rs {
-                out.push(side(rect(rs as usize), d0));
-            }
+            let (p0, d0, p3, d3) = ports(rect(ta), rect(tb));
             let reach = ((p3 - p0).length() * 0.4).clamp(4.0, 160.0);
             let curve = [p0, p0 + d0 * reach, p3 + d3 * reach, p3];
+            if joined {
+                around(out, rect(ta), p0, clearance);
+            }
             out.extend((0..=16).map(|i| bez_point(&curve, i as f32 / 16.0)));
         }
     }
-    if down_done {
-        for &(at, r) in down.iter().rev() {
-            follow(out, at, r);
+
+    // Down: in-buses from `tb` to `rd`, collected bottom-up.
+    let mut down: Vec<(usize, Option<&[[f32; 2]]>)> = Vec::new();
+    let mut n = rd as usize;
+    while n != tb {
+        let parent = nodes.parent[n].idx();
+        down.push((parent, route(parent, n)));
+        n = parent;
+    }
+    let ended_at_rd = down.first().is_none_or(|(_, r)| r.is_some());
+    let mut joined = true;
+    for &(at, r) in down.iter().rev() {
+        match r {
+            Some(r) => {
+                add(out, joined.then_some(at), r);
+                joined = true;
+            }
+            None => joined = false,
         }
-    } else if let Some(&last) = out.last() {
-        // Enter `rd` on the side the edge comes from.
-        let r = rect(rd as usize);
-        let to = r.center() - last;
+    }
+
+    // Ends the layout did not route: leave / enter the box on the side facing the path.
+    let facing = |n: u32, q: Pos2| {
+        let r = rect(n as usize);
+        let to = q - r.center();
         let d = if to.x.abs() * r.height() > to.y.abs() * r.width() {
             Vec2::new(to.x.signum(), 0.0)
         } else {
             Vec2::new(0.0, to.y.signum())
         };
-        out.push(side(r, -d));
+        side(r, d)
+    };
+    if !started_at_rs && let Some(&first) = out.first() {
+        out.insert(0, facing(rs, first));
+    }
+    if !ended_at_rd && let Some(&last) = out.last() {
+        out.push(facing(rd, last));
     }
     out.dedup_by(|a, b| a.distance(*b) < 0.25);
 }
@@ -678,10 +735,10 @@ fn draw_focus_edges(
 ) {
     let range = sel.0..g.nodes.subtree_end[sel.idx()].0;
     let mut seen = rustc_hash::FxHashSet::<(u32, u32, bool)>::default();
-    let mut budget = 3000usize;
     let mut path: Vec<Pos2> = Vec::new();
-    let mut smooth_path: Vec<Pos2> = Vec::new();
-    for n in range.clone() {
+    let mut paths: Vec<Vec<Pos2>> = Vec::new();
+    let mut styles: Vec<(egui::Color32, f32)> = Vec::new();
+    'collect: for n in range.clone() {
         let lists = [(g.edges.out.of(NodeId(n)), true), (g.edges.inc.of(NodeId(n)), false)];
         for (list, outgoing) in lists {
             for &e in list {
@@ -695,11 +752,15 @@ fn draw_focus_edges(
                     continue;
                 }
                 // An end that is off-screen is represented by a box around the
-                // other end: aim at where it really is instead.
+                // other end: aim at where it really is instead (if it is folded
+                // away: at the closed box that holds it).
                 if g.nodes.is_ancestor_of(NodeId(rd), NodeId(rs)) {
-                    rd = d.0;
+                    rd = l.shown[d.idx()];
                 } else if g.nodes.is_ancestor_of(NodeId(rs), NodeId(rd)) {
-                    rs = s.0;
+                    rs = l.shown[s.idx()];
+                }
+                if rs == rd {
+                    continue;
                 }
                 if !seen.insert((rs, rd, outgoing)) {
                     continue;
@@ -713,23 +774,95 @@ fn draw_focus_edges(
                 if path.len() < 2 {
                     continue;
                 }
-                rounded(&path, 7.0, &mut smooth_path);
                 let w = 1.2 + (g.edges.weight[e.idx()] as f32).log2().max(0.0) * 0.6;
-                painter.add(Shape::line(smooth_path.clone(), Stroke::new(w, color.gamma_multiply(0.75))));
-                // Flow dots, src → dst.
-                let len: f32 = smooth_path.windows(2).map(|s| s[0].distance(s[1])).sum::<f32>().max(1.0);
-                let dots = ((len / 60.0) as usize).clamp(1, 24);
-                let phase = (now as f32 * 120.0 / len).fract();
-                for k in 0..dots {
-                    let t = (phase + k as f32 / dots as f32).fract();
-                    painter.circle_filled(along_path(&smooth_path, t * len), w + 1.0, color);
-                }
-                budget = budget.saturating_sub(1);
-                if budget == 0 {
-                    return;
+                paths.push(std::mem::take(&mut path));
+                styles.push((color, w));
+                if paths.len() == MAX_FOCUS_EDGES {
+                    break 'collect;
                 }
             }
         }
+    }
+    // A bundle may be about as wide as the lane the layout reserves for it.
+    spread(&mut paths, 2.0, (8.0 * view.zoom).clamp(4.0, 14.0));
+    let mut smooth_path: Vec<Pos2> = Vec::new();
+    for (path, (color, w)) in paths.iter().zip(styles) {
+        rounded(path, 7.0, &mut smooth_path);
+        painter.add(Shape::line(smooth_path.clone(), Stroke::new(w, color.gamma_multiply(0.75))));
+        // Flow dots, src → dst.
+        let len: f32 = smooth_path.windows(2).map(|s| s[0].distance(s[1])).sum::<f32>().max(1.0);
+        let dots = ((len / 60.0) as usize).clamp(1, 24);
+        let phase = (now as f32 * 120.0 / len).fract();
+        for k in 0..dots {
+            let t = (phase + k as f32 / dots as f32).fract();
+            painter.circle_filled(along_path(&smooth_path, t * len), w + 1.0, color);
+        }
+    }
+}
+
+/// Give paths that run along the same stretch a track each: every segment
+/// used by `n` paths is fanned out into `n` parallel lines, `spacing` apart
+/// (less if they would be wider than `max_width` together). A path keeps its
+/// place among the others from stretch to stretch (they are ordered by index),
+/// so bundles stay parallel instead of weaving.
+fn spread(paths: &mut [Vec<Pos2>], spacing: f32, max_width: f32) {
+    // Segments as undirected pairs of half-pixel grid points.
+    type Key = ((i32, i32), (i32, i32));
+    let grid = |p: Pos2| ((p.x * 2.0).round() as i32, (p.y * 2.0).round() as i32);
+    let key = |a: Pos2, b: Pos2| -> Key {
+        let (a, b) = (grid(a), grid(b));
+        if a <= b { (a, b) } else { (b, a) }
+    };
+    let mut users: rustc_hash::FxHashMap<Key, u32> = Default::default();
+    // Per path, per segment: its slot among the segment's users.
+    let slots: Vec<Vec<u32>> = paths
+        .iter()
+        .map(|p| {
+            p.windows(2)
+                .map(|w| {
+                    let n = users.entry(key(w[0], w[1])).or_default();
+                    *n += 1;
+                    *n - 1
+                })
+                .collect()
+        })
+        .collect();
+    let mut lines: Vec<(Pos2, Pos2)> = Vec::new();
+    for (path, slots) in paths.iter_mut().zip(&slots) {
+        // Each segment moved sideways onto its track. "Sideways" is fixed per
+        // segment whatever direction a path runs it in.
+        lines.clear();
+        let mut moved = false;
+        for (w, &slot) in path.windows(2).zip(slots) {
+            let k = key(w[0], w[1]);
+            let n = users[&k] as f32;
+            let step = if n > 1.0 { spacing.min(max_width / (n - 1.0)) } else { 0.0 };
+            let off = (slot as f32 - (n - 1.0) * 0.5) * step;
+            let d = if grid(w[0]) <= grid(w[1]) { w[1] - w[0] } else { w[0] - w[1] };
+            let normal = Vec2::new(-d.y, d.x).normalized() * off;
+            moved |= off != 0.0;
+            lines.push((w[0] + normal, w[1] + normal));
+        }
+        if !moved {
+            continue;
+        }
+        // Rejoin: neighbouring segments meet where their tracks cross.
+        path.clear();
+        path.push(lines[0].0);
+        for w in lines.windows(2) {
+            let ((a0, a1), (b0, b1)) = (w[0], w[1]);
+            let (da, db) = (a1 - a0, b1 - b0);
+            let cross = da.x * db.y - da.y * db.x;
+            if cross.abs() > 0.05 * da.length() * db.length() {
+                let t = ((b0.x - a0.x) * db.y - (b0.y - a0.y) * db.x) / cross;
+                path.push(a0 + da * t);
+            } else {
+                // Parallel: a short link from one track to the other.
+                path.extend([a1, b0]);
+            }
+        }
+        path.push(lines[lines.len() - 1].1);
+        path.dedup_by(|a, b| a.distance(*b) < 0.25);
     }
 }
 

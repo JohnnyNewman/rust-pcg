@@ -18,3 +18,4 @@ bevy.workspace = true
 bevy_egui.workspace = true
 rustc-hash.workspace = true
 notify.workspace = true
+serde_json.workspace = true

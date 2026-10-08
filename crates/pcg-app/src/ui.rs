@@ -22,6 +22,7 @@ pub fn ui(
     tr: Res<Transition>,
     watch: Res<Watch>,
     mut editing: ResMut<Editing>,
+    mut vs: ResMut<ViewState>,
     lsp: Res<Lsp>,
     time: Res<Time>,
 ) -> Result {
@@ -40,6 +41,9 @@ pub fn ui(
     let mut select: Option<NodeId> = None;
     let mut fly: Option<NodeId> = None;
     let mut edit: Option<NodeId> = None;
+    // View-state requests: fold / unfold a container, focus on a node (`NONE`: leave focus).
+    let mut fold: Option<NodeId> = None;
+    let mut focus: Option<NodeId> = None;
 
     // ---- top bar -----------------------------------------------------------
     egui::Panel::top("top").show(&mut root, |ui| {
@@ -51,7 +55,7 @@ pub fn ui(
             } else {
                 ui.label(
                     RichText::new(
-                        "click a box to select · double-click to focus · Enter to edit · scroll to zoom · drag to pan",
+                        "click a box to select · double-click to fly there · Enter to edit · C to fold · Shift+F to focus",
                     )
                     .color(theme::TEXT_DIM),
                 );
@@ -62,6 +66,21 @@ pub fn ui(
                 ui.label(RichText::new(format!("{} drawn", scratch.drawn)).color(theme::TEXT_DIM));
                 ui.separator();
                 ui.checkbox(&mut st.show_all_edges, "all edges");
+                if !vs.folds.collapsed.is_empty()
+                    && ui.button("unfold all").on_hover_text("Open every folded container").clicked()
+                {
+                    crate::viewstate::expand_all(&mut vs);
+                }
+                let focused = vs.folds.focus.is_some();
+                if ui
+                    .selectable_label(focused, "focus")
+                    .on_hover_text(
+                        "Focus on the selection (Shift+F): what it does not call and is not called by is folded away and dimmed.",
+                    )
+                    .clicked()
+                {
+                    focus = Some(if focused { NodeId::NONE } else { sel.selected });
+                }
                 ui.selectable_value(&mut st.face, Face::Summary, "summary face");
                 ui.selectable_value(&mut st.face, Face::Code, "code face");
             });
@@ -74,7 +93,12 @@ pub fn ui(
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut st.path_input).desired_width(180.0));
             if ui.button("Open").clicked() {
-                *req = LoadRequest { path: st.path_input.clone().into(), pending: true, keep_view: false };
+                *req = LoadRequest {
+                    path: st.path_input.clone().into(),
+                    pending: true,
+                    keep_view: false,
+                    relayout: false,
+                };
             }
         });
         if ui.button("⟳ Reload").clicked() {
@@ -146,7 +170,7 @@ pub fn ui(
     {
         egui::Panel::right("inspector").default_size(380.0).show(&mut root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                inspector(ui, p, &mut sel, &mut st, &mut req, &mut select, &mut fly, &mut edit);
+                inspector(ui, p, &mut sel, &mut st, &mut req, &mut select, &mut fly, &mut edit, &mut fold, &mut focus);
             });
         });
     }
@@ -175,12 +199,14 @@ pub fn ui(
 
     // ---- keyboard ----------------------------------------------------------------
     if let Some(p) = &data {
-        let (esc, f, back, enter) = ctx.input(|i| {
+        let (esc, f, back, enter, c, shift) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::Backspace),
                 i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::C) && !i.modifiers.command && !i.modifiers.ctrl,
+                i.modifiers.shift,
             )
         });
         // Esc closes the focused editor first.
@@ -192,8 +218,15 @@ pub fn ui(
             if esc && !editing_now {
                 select = Some(NodeId::NONE);
             }
-            if f {
+            if f && shift {
+                // On the selection; again on the same node (or on nothing): back out.
+                let key = sel.selected.is_some().then(|| p.graph.nodes.stable_key[sel.selected.idx()]);
+                focus = Some(if key == vs.folds.focus { NodeId::NONE } else { sel.selected });
+            } else if f {
                 if sel.selected.is_some() { fly = Some(sel.selected) } else { view.needs_fit = true }
+            }
+            if c && sel.selected.is_some() {
+                fold = Some(sel.selected);
             }
             if back && sel.selected.is_some() {
                 let parent = p.graph.nodes.parent[sel.selected.idx()];
@@ -212,8 +245,21 @@ pub fn ui(
         }
         crate::edit::editors(ctx, p, &view, &mut editing, &mut st, &mut req, now);
 
+        // ---- view state ------------------------------------------------------
+        if let Some(n) = fold.filter(|n| n.idx() < p.graph.nodes.len()) {
+            crate::viewstate::toggle(&mut vs, p, n);
+        }
+        if let Some(n) = focus.filter(|n| n.is_none() || n.idx() < p.graph.nodes.len()) {
+            crate::viewstate::focus(&mut vs, p, n);
+        }
         if let Some(n) = fly {
-            view.fly_to_node(&p.layout, n);
+            // Something folded away: open up to it first, and fly once it has a place.
+            if crate::viewstate::reveal(&mut vs, p, n) {
+                select = Some(n);
+                vs.fly_to_selection = true;
+            } else {
+                view.fly_to_node(&p.layout, n);
+            }
         }
     }
     if let Some(s) = select
@@ -296,6 +342,8 @@ fn inspector(
     select: &mut Option<NodeId>,
     fly: &mut Option<NodeId>,
     edit: &mut Option<NodeId>,
+    fold: &mut Option<NodeId>,
+    focus: &mut Option<NodeId>,
 ) {
     let g = &p.graph;
     let n = sel.selected;
@@ -325,6 +373,21 @@ fn inspector(
             .monospace()
             .color(theme::TEXT_DIM),
     );
+    ui.horizontal(|ui| {
+        if !g.nodes.descendants(n).is_empty() {
+            let verb = if p.layout.collapsed[i] { "Unfold" } else { "Fold" };
+            if ui.button(verb).on_hover_text("Close this container to one box, or open it again (C)").clicked() {
+                *fold = Some(n);
+            }
+        }
+        if ui
+            .button("Focus")
+            .on_hover_text("Fold away and dim what this neither calls nor is called by (Shift+F)")
+            .clicked()
+        {
+            *focus = Some(n);
+        }
+    });
     ui.separator();
 
     // Summary / intent faces.
