@@ -1,2 +1,4 @@
 target/
 *.pcg-cache/
+claude/
+.pcg/

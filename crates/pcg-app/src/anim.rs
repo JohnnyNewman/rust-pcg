@@ -9,6 +9,11 @@
 //!            0.35 ─ enter ── 0.75      new nodes fade in once their parent has made room
 //! 0.00 ─ flash ──────────────── 1.60   changed nodes glow, then settle
 //! ```
+//!
+//! A change of view state (folding, focus) is the same hand-over between two
+//! layouts of one graph: only the move phase has something to do. Children of
+//! a container being closed shrink into it and fade; those of one being
+//! opened grow out of its centre.
 
 use crate::model::*;
 use crate::theme::smooth;
@@ -83,6 +88,24 @@ impl<'a> Anim<'a> {
         let rise = smooth(0.0, 0.15, self.t);
         let fall = 1.0 - smooth(0.5, FLASH, self.t);
         w * rise * fall
+    }
+
+    /// For a container that is closed now: how much of its children still
+    /// shows (they fade while they shrink into it, if it was open before).
+    #[inline]
+    pub fn folding(&self, i: usize) -> f32 {
+        let o = self.diff.old_of_new[i];
+        let pl = &self.prev.layout;
+        if o.is_some() && pl.shown[o.idx()] == o.0 && !pl.collapsed[o.idx()] { 1.0 - self.k } else { 0.0 }
+    }
+
+    /// How dimmed (0..1) node `i` is on its way to `now`.
+    #[inline]
+    pub fn dim(&self, i: usize, now: bool) -> f32 {
+        let o = self.diff.old_of_new[i];
+        let before = o.is_some() && self.prev.dim.get(o.idx()) == Some(&true);
+        let (a, b) = (before as u8 as f32, now as u8 as f32);
+        a + (b - a) * self.k
     }
 
     /// Exit progress 0..1 (1 = gone).

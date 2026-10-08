@@ -17,7 +17,9 @@
 //!   side; the edge continues from that very point one level up. So an edge
 //!   between distant nodes is routed level by level, bundled with its like.
 //! * **Shelf**: children without sibling edges (and containers too big or too
-//!   lopsided for layering) are packed into rows in source order.
+//!   lopsided for layering) are packed into rows in source order. Their edges
+//!   run in the gaps between the rows and around the padding ring to ports
+//!   on the container's left and right side.
 //!
 //! Two linear, non-recursive passes over the pre-order node table:
 //!
@@ -28,8 +30,17 @@
 //!    absolute positions.
 //!
 //! Output is SoA (`x, y, w, h`) so the renderer can cull with straight loops.
+//!
+//! [`Hints`] carry what is not in the graph: which containers the user has
+//! **collapsed** (they are sized like a leaf, their descendants hidden, and
+//! edges into them end on the container), and where things were in the
+//! **previous layout** — so that an edit moves as little as possible:
+//! sub-modules keep their order although their sizes changed, and a layered
+//! container keeps its axis and band wrap unless another is clearly better.
 
 use pcg_core::{NodeId, NodeKind, NodeTable};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutParams {
@@ -97,6 +108,22 @@ impl Routes {
     }
 }
 
+/// How a layered container runs: `[axis, layers per band]`. Axis 0 = not
+/// layered, 1 = layers along x, 2 = along y; `u16::MAX` layers = one band.
+pub type Flow = [u16; 2];
+
+/// What the caller knows beyond the graph. All columns are per node; an empty
+/// one means "nothing known".
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Hints<'a> {
+    /// Containers drawn closed.
+    pub collapsed: &'a [bool],
+    /// [`Layout::rank`] of the node in the previous layout (`u32::MAX`: new).
+    pub rank: &'a [u32],
+    /// [`Layout::flow`] of the node in the previous layout.
+    pub flow: &'a [Flow],
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Layout {
     pub x: Vec<f32>,
@@ -104,6 +131,15 @@ pub struct Layout {
     pub w: Vec<f32>,
     pub h: Vec<f32>,
     pub routes: Routes,
+    /// The node drawn for this one: itself, or its outermost collapsed
+    /// ancestor. Hidden nodes have an empty rect in that ancestor's centre.
+    pub shown: Vec<u32>,
+    /// Closed containers (that are themselves shown).
+    pub collapsed: Vec<bool>,
+    /// Place among the siblings, in the order the parent arranged them.
+    /// `u32::MAX` for the root and for hidden nodes.
+    pub rank: Vec<u32>,
+    pub flow: Vec<Flow>,
 }
 
 impl Layout {
@@ -176,24 +212,170 @@ fn local_edges(nodes: &NodeTable, src: &[NodeId], dst: &[NodeId]) -> Vec<Local> 
     out
 }
 
+/// Reorder `v` so that the nodes with a previous `rank` are in their previous
+/// order; a new node stays right behind the one it followed in `v`.
+fn keep_order(v: &mut [NodeId], rank: &[u32], keyed: &mut Vec<((u64, u32), NodeId)>) {
+    keyed.clear();
+    let mut anchor = (0u64, 0u32);
+    for &c in v.iter() {
+        match rank.get(c.idx()) {
+            Some(&r) if r != u32::MAX => anchor = (r as u64 + 1, 0),
+            _ => anchor.1 += 1,
+        }
+        keyed.push((anchor, c));
+    }
+    keyed.sort_by_key(|e| e.0);
+    for (slot, e) in v.iter_mut().zip(keyed.iter()) {
+        *slot = e.1;
+    }
+}
+
+/// Focus on `focus`: `keep[i]` is set for the focus and everything inside
+/// it, for every node with an edge to or from there, and for the ancestors of
+/// all these. The rest is what a focus view folds away.
+pub fn related(nodes: &NodeTable, src: &[NodeId], dst: &[NodeId], focus: NodeId) -> Vec<bool> {
+    let mut keep = vec![false; nodes.len()];
+    let inside = focus.0..nodes.subtree_end[focus.idx()].0;
+    keep[inside.start as usize..inside.end as usize].fill(true);
+    for (&s, &d) in src.iter().zip(dst) {
+        match (inside.contains(&s.0), inside.contains(&d.0)) {
+            (true, false) => keep[d.idx()] = true,
+            (false, true) => keep[s.idx()] = true,
+            _ => {}
+        }
+    }
+    for i in (0..nodes.len()).rev() {
+        let par = nodes.parent[i];
+        if keep[i] && par.is_some() {
+            keep[par.idx()] = true;
+        }
+    }
+    keep
+}
+
+/// The rows of a shelf: per row its `[y0, y1]`, per child its row.
+#[derive(Default)]
+struct Rows {
+    span: Vec<[f32; 2]>,
+    of: Vec<u32>,
+}
+
 /// Shelf-pack `kids` (sizes in `l`) into rows of about `row_w`, writing their
 /// positions relative to `(x0, y0)`. Returns the block's `(width, height)`.
-fn shelf(l: &mut Layout, kids: &[NodeId], row_w: f32, (x0, y0): (f32, f32), gap: f32) -> (f32, f32) {
+fn shelf(l: &mut Layout, kids: &[NodeId], row_w: f32, (x0, y0): (f32, f32), gap: f32, rows: &mut Rows) -> (f32, f32) {
+    rows.span.clear();
+    rows.of.clear();
     let (mut cx, mut cy, mut row_h, mut max_x) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for &c in kids {
         let (cw, ch) = (l.w[c.idx()], l.h[c.idx()]);
         if cx > 0.0 && cx + cw > row_w {
+            rows.span.push([y0 + cy, y0 + cy + row_h]);
             cy += row_h + gap;
             cx = 0.0;
             row_h = 0.0;
         }
         l.x[c.idx()] = x0 + cx;
         l.y[c.idx()] = y0 + cy;
+        rows.of.push(rows.span.len() as u32);
         cx += cw + gap;
         row_h = row_h.max(ch);
         max_x = max_x.max(cx - gap);
     }
+    rows.span.push([y0 + cy, y0 + cy + row_h]);
     (max_x, cy + row_h)
+}
+
+/// Where the shelf-packed children of a container find its ports.
+struct ShelfGeometry {
+    /// Content size of the container.
+    inner: (f32, f32),
+    /// 1: ports on the left (in) and right (out) side, at these `y`;
+    /// 2: on the top (in) and bottom (out) side, at these `x`.
+    orient: u8,
+    port_in: f32,
+    port_out: f32,
+    /// For `orient == 2`: the free column between the layered block and the
+    /// shelf beside it.
+    corridor: f32,
+}
+
+/// Routes of shelf-packed children (`kids` at their positions relative to the
+/// content origin).
+///
+/// Edges leave a child downwards into the gap below its row and run right to
+/// the padding ring; entering edges arrive along the gap above the row. From
+/// there they follow the ring to the container's ports. Sibling edges go out
+/// one way and in the other.
+#[allow(clippy::too_many_arguments)]
+fn shelf_routes(
+    l: &Layout,
+    sc: &mut Scratch,
+    container: u32,
+    kids: &[NodeId],
+    rows: &Rows,
+    es: &[Local],
+    geo: &ShelfGeometry,
+    p: &LayoutParams,
+) {
+    for (s, c) in kids.iter().enumerate() {
+        sc.slot[c.idx()] = s as u32;
+    }
+    // In the gap between two rows: entering edges nearer the row below,
+    // leaving ones nearer the row above.
+    let d = p.gap.min(p.pad) * 0.66;
+    let half = p.pad * 0.5;
+    let (ring_l, ring_r, ring_t, ring_b) = (-half, geo.inner.0 + half, -half, geo.inner.1 + half);
+    let row = |sc: &Scratch, n: u32| rows.span[rows.of[sc.slot[n as usize] as usize] as usize];
+    let out_of = |sc: &Scratch, n: u32| {
+        let (c, below) = (n as usize, row(sc, n)[1] + d);
+        let x = l.x[c] + l.w[c] * 0.66;
+        [[x, l.y[c] + l.h[c]], [x, below], [ring_r, below]]
+    };
+    // From the vertical line `from_x` into `n`.
+    let into = |sc: &Scratch, n: u32, from_x: f32| {
+        let (c, above) = (n as usize, row(sc, n)[0] - d);
+        let x = l.x[c] + l.w[c] * 0.33;
+        [[from_x, above], [x, above], [x, l.y[c]]]
+    };
+    for &(_, kind, a, b) in es {
+        if sc.slot[a as usize] == u32::MAX {
+            continue;
+        }
+        let start = sc.pts.len() as u32;
+        // The point on the container's side is put there once its size is known.
+        let (from, to) = match (kind, geo.orient) {
+            (LEAVES, 1) => {
+                sc.pts.extend(out_of(sc, a));
+                sc.pts.extend([[ring_r, geo.port_out], [ring_r, geo.port_out]]);
+                (a, container)
+            }
+            (LEAVES, _) => {
+                sc.pts.extend(out_of(sc, a));
+                sc.pts.extend([[ring_r, ring_b], [geo.port_out, ring_b], [geo.port_out, ring_b]]);
+                (a, container)
+            }
+            (ENTERS, 1) => {
+                sc.pts.extend([[ring_l, geo.port_in], [ring_l, geo.port_in]]);
+                sc.pts.extend(into(sc, a, ring_l));
+                (container, a)
+            }
+            (ENTERS, _) => {
+                sc.pts.extend([[geo.port_in, ring_t], [geo.port_in, ring_t], [geo.corridor, ring_t]]);
+                sc.pts.extend(into(sc, a, geo.corridor));
+                (container, a)
+            }
+            _ => {
+                // Out to the right ring, then in from there along the gap above `b`.
+                sc.pts.extend(out_of(sc, a));
+                sc.pts.extend(into(sc, b, ring_r));
+                (a, b)
+            }
+        };
+        sc.routes.push((from, to, container, start, sc.pts.len() as u32, kind));
+    }
+    for c in kids {
+        sc.slot[c.idx()] = u32::MAX;
+    }
 }
 
 /// Per-node results of the bottom-up pass that parents build on, and scratch
@@ -242,7 +424,12 @@ struct Block {
     orient: u8,
     port_in: f32,
     port_out: f32,
+    /// Layers per band (`u16::MAX`: all in one).
+    per: u16,
 }
+
+/// A previous axis / wrap is kept unless another scores better by this much.
+const STICKY: f32 = 0.3;
 
 /// Layered (Sugiyama-style) arrangement of the children `conn`, which are
 /// connected by the sibling edges in `es`.
@@ -257,14 +444,24 @@ struct Block {
 ///    and back a few times.
 /// 5. Layers are stacked along x or y and wrapped into bands — whichever
 ///    brings the block closest to the target aspect — and centred in their
-///    band.
+///    band. The choice of the previous layout (`prefer`) wins unless it has
+///    become clearly worse.
 /// 6. Routes: each edge as an orthogonal polyline through gutters and lanes;
 ///    from the end of one band to the start of the next it runs around
-///    through the channel between the two.
+///    through the channel between the two. Edges jogging in the same gutter
+///    get a track each, ordered so that they do not cross needlessly.
 ///
 /// Writes the children's positions relative to `(0, 0)` and records a route
 /// per edge.
-fn layered(l: &mut Layout, sc: &mut Scratch, container: u32, conn: &[NodeId], es: &[Local], p: &LayoutParams) -> Block {
+fn layered(
+    l: &mut Layout,
+    sc: &mut Scratch,
+    container: u32,
+    conn: &[NodeId],
+    es: &[Local],
+    prefer: Flow,
+    p: &LayoutParams,
+) -> Block {
     const NONE: u32 = u32::MAX;
     let k = conn.len();
     for (s, c) in conn.iter().enumerate() {
@@ -456,23 +653,32 @@ fn layered(l: &mut Layout, sc: &mut Scratch, container: u32, conn: &[NodeId], es
         (u + wrapped, v + v_gaps)
     };
     let (dh, dv) = (dims(l, true), dims(l, false));
+    let score = |horiz: bool, per: usize| {
+        let (u, v) = extent(if horiz { &dh } else { &dv }, per);
+        let aspect = if horiz { u / v.max(1.0) } else { v / u.max(1.0) };
+        // A wrap costs a detour for the edges across it: only for a clearly better shape.
+        (aspect / p.aspect).ln().abs() + 0.15 * (n_layers.div_ceil(per) - 1) as f32
+    };
     let mut best = (f32::MAX, true, n_layers);
     for horiz in [true, false] {
         for per in (1..=n_layers).rev() {
-            let (u, v) = extent(if horiz { &dh } else { &dv }, per);
-            let aspect = if horiz { u / v.max(1.0) } else { v / u.max(1.0) };
-            // A wrap costs a detour for the edges across it: only for a clearly better shape.
-            let score = (aspect / p.aspect).ln().abs() + 0.15 * (n_layers.div_ceil(per) - 1) as f32;
-            if score < best.0 {
-                best = (score, horiz, per);
+            let s = score(horiz, per);
+            if s < best.0 {
+                best = (s, horiz, per);
             }
+        }
+    }
+    if prefer[0] != 0 && n_layers > 0 {
+        let (horiz, per) = (prefer[0] == 1, (prefer[1] as usize).clamp(1, n_layers));
+        if score(horiz, per) <= best.0 + STICKY {
+            best = (0.0, horiz, per);
         }
     }
     let (_, horiz, per) = best;
     let d = if horiz { dh } else { dv };
     let (total_u, total_v) = extent(&d, per);
     let wrapped = n_layers > per;
-    // Per layer its `[u0, u1]` and band; per band the channel line behind it.
+    // Per layer its `[u0, u1]`; per band where the channel behind it starts.
     let mut span = vec![[0f32; 2]; n_layers];
     let mut channel: Vec<f32> = Vec::new();
     // Per vertex its centre line `v`; per child its `[v0, v1]` and `[u0, u1]`.
@@ -501,7 +707,7 @@ fn layered(l: &mut Layout, sc: &mut Scratch, container: u32, conn: &[NodeId], es
             span[at] = [u, u + thick];
             u += thick + g;
         }
-        channel.push(band_v + band_len + g * 0.5);
+        channel.push(band_v + band_len);
         band_v += band_len + g;
     }
 
@@ -524,14 +730,29 @@ fn layered(l: &mut Layout, sc: &mut Scratch, container: u32, conn: &[NodeId], es
         }
     };
     let xy = |u: f32, v: f32| if horiz { [u, v] } else { [v, u] };
+    // Tracks: where in its gutter each jog `(layer, v0, v1)` runs, as a
+    // fraction of the gutter's width. Unknown jogs are noted for the next pass.
+    let tracks: RefCell<HashMap<(usize, u32, u32), f32>> = RefCell::default();
+    let wanted: RefCell<Vec<(usize, u32, u32)>> = RefCell::default();
     // From the end of layer `at` (at `v0`) to the start of the next (at `v1`):
     // a jog in the gutter between them, or around the band ends.
     let hop = |pts: &mut Vec<[f32; 2]>, at: usize, v0: f32, v1: f32| {
-        if !(at + 1).is_multiple_of(per) {
-            let m = (span[at][1] + span[at + 1][0]) * 0.5;
+        let wraps = (at + 1).is_multiple_of(per);
+        if v0 == v1 && !wraps {
+            return;
+        }
+        let key = (at, v0.to_bits(), v1.to_bits());
+        let t = tracks.borrow().get(&key).copied().unwrap_or_else(|| {
+            wanted.borrow_mut().push(key);
+            0.5
+        });
+        if !wraps {
+            let m = span[at][1] + (span[at + 1][0] - span[at][1]) * t;
             pts.extend([xy(m, v0), xy(m, v1)]);
         } else {
-            let (right, left, ch) = (span[at][1] + g * 0.25, g * 0.25, channel[at / per]);
+            // Nested like brackets: further out on the right, lower in the
+            // channel, further in on the left.
+            let (right, left, ch) = (span[at][1] + g * 0.5 * t, g * 0.5 * t, channel[at / per] + g * t);
             pts.extend([xy(right, v0), xy(right, ch), xy(left, ch), xy(left, v1)]);
         }
     };
@@ -550,57 +771,124 @@ fn layered(l: &mut Layout, sc: &mut Scratch, container: u32, conn: &[NodeId], es
             }
         }
     };
-    for (a, b, rev, first, count) in wires {
-        let (la, lb) = (layer[a as usize] as usize, layer[b as usize] as usize);
-        let lane = |at: usize| mid[first as usize + at - la - 1];
-        let va = port(sc, a, if count > 0 { lane(la + 1) } else { mid[b as usize] }, (!rev).then_some(true));
-        let vb = port(sc, b, if count > 0 { lane(lb - 1) } else { va }, (!rev).then_some(false));
-        let start = sc.pts.len() as u32;
-        sc.pts.push(xy(along[a as usize][1], va));
-        run(&mut sc.pts, la, lb, va, vb, &lane);
-        sc.pts.push(xy(along[b as usize][0], vb));
-        let (mut from, mut to) = (conn[a as usize].0, conn[b as usize].0);
-        if rev {
-            // Laid out backwards: the real edge runs the route the other way.
-            sc.pts[start as usize..].reverse();
-            std::mem::swap(&mut from, &mut to);
-        }
-        sc.routes.push((from, to, container, start, sc.pts.len() as u32, SIBLING));
-    }
     let (v_in, v_out) = (bus_in[0], bus_out[n_layers - 1]);
-    for v in (0..k).filter(|&v| leaves[v]) {
-        let la = layer[v] as usize;
-        let lane = |at: usize| mid[bus_out[at] as usize];
-        let pv = port(sc, v as u32, lane(la + 1), Some(true));
-        let start = sc.pts.len() as u32;
-        sc.pts.push(xy(along[v][1], pv));
-        run(&mut sc.pts, la, n_layers - 1, pv, mid[v_out as usize], &lane);
-        // The last point is moved onto the container's side once that is known.
-        sc.pts.push(xy(total_u, mid[v_out as usize]));
-        sc.routes.push((conn[v].0, container, container, start, sc.pts.len() as u32, LEAVES));
-    }
-    for v in (0..k).filter(|&v| enters[v]) {
-        let lb = layer[v] as usize;
-        let lane = |at: usize| mid[bus_in[at] as usize];
-        let pv = port(sc, v as u32, lane(lb - 1), Some(false));
-        let start = sc.pts.len() as u32;
-        sc.pts.push(xy(0.0, mid[v_in as usize]));
-        run(&mut sc.pts, 0, lb, mid[v_in as usize], pv, &lane);
-        sc.pts.push(xy(along[v][0], pv));
-        sc.routes.push((container, conn[v].0, container, start, sc.pts.len() as u32, ENTERS));
+    let (routes_mark, pts_mark) = (sc.routes.len(), sc.pts.len());
+    // Pass 0 finds out which jogs there are, pass 1 runs them on their tracks.
+    for pass in 0..2 {
+        for &(a, b, rev, first, count) in &wires {
+            let (la, lb) = (layer[a as usize] as usize, layer[b as usize] as usize);
+            let lane = |at: usize| mid[first as usize + at - la - 1];
+            let va = port(sc, a, if count > 0 { lane(la + 1) } else { mid[b as usize] }, (!rev).then_some(true));
+            let vb = port(sc, b, if count > 0 { lane(lb - 1) } else { va }, (!rev).then_some(false));
+            let start = sc.pts.len() as u32;
+            sc.pts.push(xy(along[a as usize][1], va));
+            run(&mut sc.pts, la, lb, va, vb, &lane);
+            sc.pts.push(xy(along[b as usize][0], vb));
+            let (mut from, mut to) = (conn[a as usize].0, conn[b as usize].0);
+            if rev {
+                // Laid out backwards: the real edge runs the route the other way.
+                sc.pts[start as usize..].reverse();
+                std::mem::swap(&mut from, &mut to);
+            }
+            sc.routes.push((from, to, container, start, sc.pts.len() as u32, SIBLING));
+        }
+        for v in (0..k).filter(|&v| leaves[v]) {
+            let la = layer[v] as usize;
+            let lane = |at: usize| mid[bus_out[at] as usize];
+            let pv = port(sc, v as u32, lane(la + 1), Some(true));
+            let start = sc.pts.len() as u32;
+            sc.pts.push(xy(along[v][1], pv));
+            run(&mut sc.pts, la, n_layers - 1, pv, mid[v_out as usize], &lane);
+            // The last point is moved onto the container's side once that is known.
+            sc.pts.push(xy(total_u, mid[v_out as usize]));
+            sc.routes.push((conn[v].0, container, container, start, sc.pts.len() as u32, LEAVES));
+        }
+        for v in (0..k).filter(|&v| enters[v]) {
+            let lb = layer[v] as usize;
+            let lane = |at: usize| mid[bus_in[at] as usize];
+            let pv = port(sc, v as u32, lane(lb - 1), Some(false));
+            let start = sc.pts.len() as u32;
+            sc.pts.push(xy(0.0, mid[v_in as usize]));
+            run(&mut sc.pts, 0, lb, mid[v_in as usize], pv, &lane);
+            sc.pts.push(xy(along[v][0], pv));
+            sc.routes.push((container, conn[v].0, container, start, sc.pts.len() as u32, ENTERS));
+        }
+        if pass == 0 {
+            sc.routes.truncate(routes_mark);
+            sc.pts.truncate(pts_mark);
+            let mut jogs = wanted.take();
+            jogs.sort_unstable_by_key(|k| k.0);
+            jogs.dedup();
+            let mut tracks = tracks.borrow_mut();
+            for gutter in jogs.chunk_by_mut(|a, b| a.0 == b.0) {
+                // Going down, the jog that starts lowest turns first; going up,
+                // the one that starts highest. So they nest instead of crossing.
+                let key = |k: &(usize, u32, u32)| {
+                    let (v0, v1) = (f32::from_bits(k.1), f32::from_bits(k.2));
+                    if v1 > v0 { (0, -v0) } else { (1, v0) }
+                };
+                gutter.sort_by(|a, b| key(a).0.cmp(&key(b).0).then(key(a).1.total_cmp(&key(b).1)));
+                let n = gutter.len() as f32;
+                for (i, k) in gutter.iter().enumerate() {
+                    tracks.insert(*k, (i + 1) as f32 / (n + 1.0));
+                }
+            }
+        }
     }
     let port_of = |bus: u32| if bus == NONE { f32::NAN } else { mid[bus as usize] };
     let (w, h) = if horiz { (total_u, total_v) } else { (total_v, total_u) };
-    Block { w, h, orient, port_in: port_of(v_in), port_out: port_of(v_out) }
+    let per = if per >= n_layers { u16::MAX } else { per as u16 };
+    Block { w, h, orient, port_in: port_of(v_in), port_out: port_of(v_out), per }
 }
 
 /// `name_len[i]`: display name length in chars (callers resolve names; this
 /// crate only sees the node table). `src` / `dst`: the graph's edges.
 pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId], p: &LayoutParams) -> Layout {
+    layout_with(nodes, name_len, src, dst, p, &Hints::default())
+}
+
+/// [`layout`] with view state and the previous layout taken into account.
+pub fn layout_with(
+    nodes: &NodeTable,
+    name_len: &[u32],
+    src: &[NodeId],
+    dst: &[NodeId],
+    p: &LayoutParams,
+    hints: &Hints,
+) -> Layout {
     let n = nodes.len();
-    let mut l =
-        Layout { x: vec![0.0; n], y: vec![0.0; n], w: vec![0.0; n], h: vec![0.0; n], routes: Routes::default() };
-    let edges = local_edges(nodes, src, dst);
+    let mut l = Layout {
+        x: vec![0.0; n],
+        y: vec![0.0; n],
+        w: vec![0.0; n],
+        h: vec![0.0; n],
+        routes: Routes::default(),
+        shown: (0..n as u32).collect(),
+        collapsed: vec![false; n],
+        rank: vec![u32::MAX; n],
+        flow: vec![[0, 0]; n],
+    };
+    // Top-down: what is hidden inside a closed container.
+    let mut any_hidden = false;
+    for i in 0..n {
+        let par = nodes.parent[i];
+        if par.is_some() {
+            let ps = l.shown[par.idx()];
+            if ps != par.0 || l.collapsed[par.idx()] {
+                l.shown[i] = ps;
+                any_hidden = true;
+                continue;
+            }
+        }
+        l.collapsed[i] = hints.collapsed.get(i) == Some(&true) && nodes.subtree_end[i].idx() > i + 1;
+    }
+    // Edges of hidden nodes end on the container that hides them.
+    let edges = if any_hidden {
+        let lift = |v: &[NodeId]| v.iter().map(|x| NodeId(l.shown[x.idx()])).collect::<Vec<_>>();
+        local_edges(nodes, &lift(src), &lift(dst))
+    } else {
+        local_edges(nodes, src, dst)
+    };
     let mut sc = Scratch {
         slot: vec![u32::MAX; n],
         orient: vec![0; n],
@@ -612,9 +900,14 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
     let mut kids: Vec<NodeId> = Vec::new();
     let mut conn: Vec<NodeId> = Vec::new();
     let mut loose: Vec<NodeId> = Vec::new();
+    let mut rows = Rows::default();
+    let mut keyed = Vec::new();
     let mut edge_end = edges.len();
 
     for i in (0..n).rev() {
+        if l.shown[i] != i as u32 {
+            continue;
+        }
         let id = NodeId::from_idx(i);
         let hs = header_scale(nodes.kind[i]);
         let header = p.header * hs;
@@ -626,14 +919,28 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
         edge_end = edge_start;
 
         kids.clear();
+        if l.collapsed[i] {
+            // Closed: the whole label, and a line saying what is inside.
+            l.w[i] = label_w.max(p.min_leaf_w);
+            l.h[i] = header + 14.0 * hs + 4.0;
+            continue;
+        }
         kids.extend(nodes.children(id));
-        // Items keep source order; sub-modules follow, tallest first (less waste).
+        // Items keep source order; sub-modules follow, tallest first (less waste)
+        // — but where they were before, if they were anywhere.
+        let big = |k: NodeKind| k.is_module() || k == NodeKind::Crate;
         kids.sort_by(|a, b| {
-            let big = |k: NodeKind| k.is_module() || k == NodeKind::Crate;
             let (ma, mb) = (big(nodes.kind[a.idx()]), big(nodes.kind[b.idx()]));
             ma.cmp(&mb)
                 .then_with(|| if ma && mb { l.h[b.idx()].total_cmp(&l.h[a.idx()]) } else { std::cmp::Ordering::Equal })
         });
+        if !hints.rank.is_empty() {
+            let first_big = kids.partition_point(|c| !big(nodes.kind[c.idx()]));
+            keep_order(&mut kids[first_big..], hints.rank, &mut keyed);
+        }
+        for (k, c) in kids.iter().enumerate() {
+            l.rank[c.idx()] = k as u32;
+        }
         if kids.is_empty() {
             let lines = nodes.lines[i].len().max(1) as f32;
             let w = label_w.clamp(p.min_leaf_w, p.max_leaf_w);
@@ -659,14 +966,16 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
             (conn, loose) = (c, o);
         }
         let (routes_mark, pts_mark) = (sc.routes.len(), sc.pts.len());
-        let mut top = Block { w: 0.0, h: 0.0, orient: 0, port_in: f32::NAN, port_out: f32::NAN };
+        let mut top = Block { w: 0.0, h: 0.0, orient: 0, port_in: f32::NAN, port_out: f32::NAN, per: 0 };
         if !conn.is_empty() && conn.len() <= p.max_layered {
-            let b = layered(&mut l, &mut sc, i as u32, &conn, es, p);
+            let prefer = hints.flow.get(i).copied().unwrap_or_default();
+            let b = layered(&mut l, &mut sc, i as u32, &conn, es, prefer, p);
             // Too lopsided (one caller of fifty, a long chain): shelf instead.
             if b.h > 4.0 * b.w.max(p.max_leaf_w) || b.w > 12.0 * b.h {
                 sc.routes.truncate(routes_mark);
                 sc.pts.truncate(pts_mark);
             } else {
+                l.flow[i] = [b.orient as u16, b.per];
                 top = b;
             }
         }
@@ -681,13 +990,34 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
         let mut row_w = (area * p.aspect).sqrt().max(widest);
         let sep = if top.orient != 0 && !rest.is_empty() { p.gap * 2.0 } else { 0.0 };
         let (inner_w, inner_h) = if top.orient == 2 {
-            let side = shelf(&mut l, rest, row_w, (top.w + sep, 0.0), p.gap);
+            let side = shelf(&mut l, rest, row_w, (top.w + sep, 0.0), p.gap, &mut rows);
             (top.w + sep + side.0, top.h.max(side.1))
         } else {
             row_w = row_w.max(label_w - 2.0 * p.pad).max(top.w);
-            let below = shelf(&mut l, rest, row_w, (0.0, top.h + sep), p.gap);
+            let below = shelf(&mut l, rest, row_w, (0.0, top.h + sep), p.gap, &mut rows);
             (top.w.max(below.0), top.h + sep + below.1)
         };
+        let inner_w = inner_w.max(label_w - 2.0 * p.pad);
+        if !rest.is_empty() && !es.is_empty() {
+            // The shelf's edges run in its gaps, to the ports the layered block
+            // has — or, without one, to ports left and right.
+            let orient = top.orient.max(1);
+            let middle = match top.orient {
+                0 => inner_h * 0.5,
+                1 => top.h * 0.5,
+                _ => top.w * 0.5,
+            };
+            let or_middle = |port: f32| if port.is_nan() { middle } else { port };
+            let geo = ShelfGeometry {
+                inner: (inner_w, inner_h),
+                orient,
+                port_in: or_middle(top.port_in),
+                port_out: or_middle(top.port_out),
+                corridor: top.w + sep * 0.5,
+            };
+            shelf_routes(&l, &mut sc, i as u32, rest, &rows, es, &geo, p);
+            top = Block { orient, port_in: geo.port_in, port_out: geo.port_out, ..top };
+        }
 
         // Move everything below the header, inside the padding.
         let (ox, oy) = (p.pad, header + p.pad);
@@ -698,7 +1028,7 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
         for pt in &mut sc.pts[pts_mark..] {
             *pt = [pt[0] + ox, pt[1] + oy];
         }
-        l.w[i] = inner_w.max(label_w - 2.0 * p.pad) + 2.0 * p.pad;
+        l.w[i] = inner_w + 2.0 * p.pad;
         l.h[i] = oy + inner_h + p.pad;
         // Ports sit on the container's sides: stretch the buses out to them.
         let axis = if top.orient == 1 { 0 } else { 1 };
@@ -715,8 +1045,10 @@ pub fn layout(nodes: &NodeTable, name_len: &[u32], src: &[NodeId], dst: &[NodeId
     }
 
     for i in 0..n {
-        let par = nodes.parent[i];
-        if par.is_some() {
+        let (par, s) = (nodes.parent[i], l.shown[i] as usize);
+        if s != i {
+            (l.x[i], l.y[i]) = (l.x[s] + l.w[s] * 0.5, l.y[s] + l.h[s] * 0.5);
+        } else if par.is_some() {
             l.x[i] += l.x[par.idx()];
             l.y[i] += l.y[par.idx()];
         }
@@ -939,6 +1271,232 @@ mod tests {
     }
 
     #[test]
+    fn jogs_in_one_gutter_get_separate_tracks() {
+        let (t, _, f) = module(6);
+        // Three callers, three callees, all crossing the same gutter.
+        let edges = [(f[0], f[3]), (f[0], f[4]), (f[1], f[5]), (f[2], f[3]), (f[2], f[5])];
+        let l = run(&t, &edges);
+        // Jogs: the segments running across the layers (a route starts along them).
+        let mut jogs: Vec<(usize, [[f32; 2]; 2])> = Vec::new();
+        let mut axis = 0;
+        for (i, (a, b)) in edges.into_iter().enumerate() {
+            let r = l.routes.get(a, b).unwrap();
+            assert_clear(&l, r, &f);
+            axis = if r[0][1] == r[1][1] { 0 } else { 1 };
+            jogs.extend(r.windows(2).filter(|w| w[0][axis] == w[1][axis] && w[0] != w[1]).map(|w| (i, [w[0], w[1]])));
+        }
+        assert!(jogs.len() >= 2, "{jogs:?}");
+        // No two routes jog on the same line with overlapping extents.
+        let lo = |s: &[[f32; 2]; 2]| s[0][1 - axis].min(s[1][1 - axis]);
+        let hi = |s: &[[f32; 2]; 2]| s[0][1 - axis].max(s[1][1 - axis]);
+        for (n, (i, p)) in jogs.iter().enumerate() {
+            for (j, q) in &jogs[n + 1..] {
+                let shared = i != j && p[0][axis] == q[0][axis] && lo(p).max(lo(q)) < hi(p).min(hi(q));
+                assert!(!shared, "{p:?} and {q:?} share a track");
+            }
+        }
+    }
+
+    #[test]
+    fn shelf_containers_route_through_their_gaps() {
+        // ws { a { 12 fns, no calls among them }, b { 2 fns } }: a is all shelf.
+        let mut t = NodeTable::default();
+        let ws = t.open(NodeId::NONE, nn(NodeKind::Workspace, 0));
+        let mut mods = Vec::new();
+        let mut f = Vec::new();
+        for count in [12, 2] {
+            let m = t.open(ws, nn(NodeKind::FileModule, 1));
+            for k in 0..count {
+                let x = t.open(m, nn(NodeKind::Fn, k));
+                t.close(x);
+                f.push(x);
+            }
+            t.close(m);
+            mods.push(m);
+        }
+        t.close(ws);
+        let (a, b) = (mods[0], mods[1]);
+        // a's fns 3 and 7 call into b; b's first calls back into a's 5.
+        let l = run(&t, &[(f[3], f[12]), (f[7], f[13]), (f[12], f[5])]);
+        assert_nested_and_disjoint(&t, &l, a);
+        let ra = rect(&l, a);
+        for (from, to) in [(f[3], a), (f[7], a), (a, f[5])] {
+            let r = l.routes.get(from, to).unwrap_or_else(|| panic!("{from:?} → {to:?}"));
+            assert_clear(&l, r, &f[..12]);
+            assert!(r.iter().all(|q| q[0] >= ra[0] && q[0] <= ra[2] && q[1] >= ra[1] && q[1] <= ra[3]));
+        }
+        // Out on the right side, in on the left, where the route between the modules takes over.
+        let out = l.routes.get(f[3], a).unwrap().last().unwrap();
+        let inn = l.routes.get(a, f[5]).unwrap()[0];
+        assert_eq!((out[0], inn[0]), (ra[2], ra[0]));
+        assert!(l.routes.get(a, b).is_some() && l.routes.get(b, a).is_some());
+    }
+
+    #[test]
+    fn shelf_children_beside_a_layered_block_are_routed_too() {
+        // ws { a { x0 → x1 layered; x2..x9 on the shelf }, b { y0 → y1 } },
+        // with shelf children of a calling into b and being called from it.
+        let mut t = NodeTable::default();
+        let ws = t.open(NodeId::NONE, nn(NodeKind::Workspace, 0));
+        let mut f = Vec::new();
+        let mut mods = Vec::new();
+        for count in [10, 2] {
+            let m = t.open(ws, nn(NodeKind::FileModule, 1));
+            for k in 0..count {
+                let x = t.open(m, nn(NodeKind::Fn, k));
+                t.close(x);
+                f.push(x);
+            }
+            t.close(m);
+            mods.push(m);
+        }
+        t.close(ws);
+        let a = mods[0];
+        let l = run(&t, &[(f[0], f[1]), (f[10], f[11]), (f[4], f[10]), (f[8], f[11]), (f[1], f[10]), (f[11], f[6])]);
+        assert_nested_and_disjoint(&t, &l, a);
+        let ra = rect(&l, a);
+        let on = |q: &[f32; 2]| q[0] == ra[0] || q[0] == ra[2] || q[1] == ra[1] || q[1] == ra[3];
+        // Shelf children and the layered one leave through the same port.
+        let port = *l.routes.get(f[1], a).expect("layered child").last().unwrap();
+        for x in [f[4], f[8]] {
+            let r = l.routes.get(x, a).expect("shelf child");
+            assert_clear(&l, r, &f[..10]);
+            assert_eq!(*r.last().unwrap(), port);
+        }
+        assert!(on(&port));
+        let r = l.routes.get(a, f[6]).expect("into a shelf child");
+        assert_clear(&l, r, &f[..10]);
+        assert!(on(&r[0]));
+    }
+
+    fn run_with(t: &NodeTable, edges: &[(NodeId, NodeId)], hints: &Hints) -> Layout {
+        let (src, dst): (Vec<_>, Vec<_>) = edges.iter().copied().unzip();
+        layout_with(t, &vec![6u32; t.len()], &src, &dst, &LayoutParams::default(), hints)
+    }
+
+    #[test]
+    fn collapsed_containers_hide_their_subtree_and_take_its_edges() {
+        // x2 (in a) → y (in b), with a closed.
+        let (t, [a, b], f, open) = two_modules(&[(1, 2)]);
+        let edges = [(f[0], f[1]), (f[2], f[3]), (f[1], f[2])];
+        let mut collapsed = vec![false; t.len()];
+        collapsed[a.idx()] = true;
+        // A leaf cannot be closed.
+        collapsed[f[3].idx()] = true;
+        let l = run_with(&t, &edges, &Hints { collapsed: &collapsed, ..Default::default() });
+        assert!(l.collapsed[a.idx()] && !l.collapsed[b.idx()] && !l.collapsed[f[3].idx()]);
+        assert!(l.w[a.idx()] * l.h[a.idx()] < open.w[a.idx()] * open.h[a.idx()], "closed is smaller");
+        for x in [f[0], f[1]] {
+            assert_eq!(l.shown[x.idx()], a.0);
+            assert_eq!((l.w[x.idx()], l.h[x.idx()]), (0.0, 0.0));
+            assert!(inside(&[l.x[x.idx()], l.y[x.idx()]], rect(&l, a)));
+        }
+        assert_eq!(l.shown[f[2].idx()], f[2].0);
+        // The edge now starts at a itself: no bus inside it, the rest as before.
+        assert!(l.routes.get(f[1], a).is_none() && l.routes.get(f[0], f[1]).is_none());
+        assert_clear(&l, l.routes.get(a, b).expect("a → b"), &[a, b]);
+        assert!(l.routes.get(b, f[2]).is_some());
+        assert_nested_and_disjoint(&t, &l, b);
+    }
+
+    /// ws { m0, m1, m2 } with `fns[k]` one-line fns each.
+    fn three_modules(fns: [u32; 3]) -> (NodeTable, [NodeId; 3]) {
+        let mut t = NodeTable::default();
+        let ws = t.open(NodeId::NONE, nn(NodeKind::Workspace, 0));
+        let mods = fns.map(|count| {
+            let m = t.open(ws, nn(NodeKind::FileModule, 1));
+            for _ in 0..count {
+                let x = t.open(m, nn(NodeKind::Fn, 1));
+                t.close(x);
+            }
+            t.close(m);
+            m
+        });
+        t.close(ws);
+        (t, mods)
+    }
+
+    #[test]
+    fn modules_keep_their_order_when_their_sizes_change() {
+        let (t, m) = three_modules([30, 12, 2]);
+        let old = run(&t, &[]);
+        let order = |l: &Layout, m: [NodeId; 3]| {
+            let mut o = [0, 1, 2];
+            o.sort_by_key(|&k| l.rank[m[k].idx()]);
+            o
+        };
+        assert_eq!(order(&old, m), [0, 1, 2], "tallest first");
+        // The smallest module grows past the others (ids shift: map the hints by position).
+        let (t2, m2) = three_modules([30, 12, 60]);
+        assert_eq!(order(&run(&t2, &[]), m2), [2, 0, 1], "from scratch it would jump to the front");
+        let mut rank = vec![u32::MAX; t2.len()];
+        for k in 0..3 {
+            rank[m2[k].idx()] = old.rank[m[k].idx()];
+        }
+        let l = run_with(&t2, &[], &Hints { rank: &rank, ..Default::default() });
+        assert_eq!(order(&l, m2), [0, 1, 2]);
+        assert_nested_and_disjoint(&t2, &l, NodeId(0));
+        // A module nobody has seen before goes where the default order puts it,
+        // behind its neighbour there.
+        rank[m2[2].idx()] = u32::MAX;
+        rank[m2[0].idx()] = 1;
+        rank[m2[1].idx()] = 0;
+        let l = run_with(&t2, &[], &Hints { rank: &rank, ..Default::default() });
+        assert_eq!(order(&l, m2), [2, 1, 0]);
+    }
+
+    #[test]
+    fn a_layered_container_keeps_its_axis_and_wrap() {
+        let chain = |f: &[NodeId]| f.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>();
+        // A call chain that grows by one function at a time. From scratch, the
+        // best axis / wrap changes now and then, and the whole module is
+        // rearranged; told how it was laid out before, it stays unless that
+        // has become clearly worse.
+        let (mut jumps, mut kept) = (0, 0);
+        for n in 6..30 {
+            let (t, m, f) = module(n);
+            let was = run(&t, &chain(&f)).flow[m.idx()];
+            let (t2, m2, f2) = module(n + 1);
+            let fresh = run(&t2, &chain(&f2)).flow[m2.idx()];
+            let mut flow = vec![[0, 0]; t2.len()];
+            flow[m2.idx()] = was;
+            let l = run_with(&t2, &chain(&f2), &Hints { flow: &flow, ..Default::default() });
+            let now = l.flow[m2.idx()];
+            assert!(now == was || now == fresh, "{n}: {was:?} → {now:?} (fresh: {fresh:?})");
+            jumps += (fresh != was) as u32;
+            kept += (fresh != was && now == was) as u32;
+            assert_nested_and_disjoint(&t2, &l, m2);
+            for (a, b) in chain(&f2) {
+                assert_clear(&l, l.routes.get(a, b).unwrap(), &f2);
+            }
+        }
+        assert!(jumps >= 3 && kept >= 2, "{kept} of {jumps} rearrangements avoided");
+    }
+
+    #[test]
+    fn a_clearly_worse_previous_flow_is_given_up() {
+        let (t, m, f) = module(12);
+        let chain: Vec<_> = f.windows(2).map(|w| (w[0], w[1])).collect();
+        let mut flow = vec![[0, 0]; t.len()];
+        flow[m.idx()] = [1, u16::MAX]; // one row of twelve
+        let l = run_with(&t, &chain, &Hints { flow: &flow, ..Default::default() });
+        assert_eq!(l.flow[m.idx()], run(&t, &chain).flow[m.idx()]);
+    }
+
+    #[test]
+    fn focus_keeps_the_neighbourhood() {
+        let (t, [a, b], f, _) = two_modules(&[]);
+        // x → x2 inside a; x2 → y across; y → y2. Focus on x2.
+        let (src, dst) = (vec![f[0], f[1], f[2]], vec![f[1], f[2], f[3]]);
+        let keep = related(&t, &src, &dst, f[1]);
+        let kept: Vec<NodeId> = (0..t.len()).map(NodeId::from_idx).filter(|n| keep[n.idx()]).collect();
+        assert_eq!(kept, vec![NodeId(0), a, f[0], f[1], b, f[2]], "y2 is two calls away");
+        // Focus on a module: everything in it, and what it calls.
+        let keep = related(&t, &src, &dst, a);
+        assert!(keep[f[0].idx()] && keep[f[2].idx()] && !keep[f[3].idx()]);
+    }
+
+    #[test]
     fn lopsided_or_huge_containers_fall_back_to_the_shelf() {
         let (t, m, f) = module(60);
         let fan: Vec<_> = f[1..].iter().map(|&c| (f[0], c)).collect();
@@ -946,5 +1504,9 @@ mod tests {
         assert_nested_and_disjoint(&t, &l, m);
         let [x0, y0, x1, y1] = rect(&l, m);
         assert!((y1 - y0) < 3.0 * (x1 - x0) && (x1 - x0) < 6.0 * (y1 - y0), "neither a tower nor a ribbon");
+        // Its sibling edges still get routes, through the gaps between the rows.
+        for &(a, b) in &fan {
+            assert_clear(&l, l.routes.get(a, b).expect("routed"), &f);
+        }
     }
 }

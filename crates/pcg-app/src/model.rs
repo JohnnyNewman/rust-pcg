@@ -6,18 +6,26 @@ use bevy_egui::egui;
 use pcg_core::{Graph, NodeId};
 use pcg_layout::Layout;
 use pcg_syntax::{Buffer, BuildStats, GraphDiff, ItemPath, ParseCache, Precise};
+use rustc_hash::FxHashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Result of the background pipeline: an immutable snapshot.
 pub struct Loaded {
-    pub graph: Graph,
+    /// Shared with the snapshots that only differ in layout (view changes).
+    pub graph: Arc<Graph>,
     pub layout: Layout,
     pub stats: BuildStats,
     pub t_layout: Duration,
     /// Per-node lowercase names for search.
-    pub search_names: Vec<Box<str>>,
+    pub search_names: Arc<[Box<str>]>,
+    /// Nodes outside the focus (empty: no focus).
+    pub dim: Vec<bool>,
+    /// [`ViewState::rev`] this was laid out for.
+    pub view_rev: u64,
+    /// Laid out for other folds than the snapshot it replaced.
+    pub view_changed: bool,
     /// Diff against the snapshot this one replaced (same project only).
     pub diff: Option<GraphDiff>,
     pub t_diff: Duration,
@@ -94,6 +102,45 @@ pub struct LoadRequest {
     pub pending: bool,
     /// Reload of the same project: keep camera and selection.
     pub keep_view: bool,
+    /// The view state changed: lay the current graph out again (nothing is
+    /// re-read). A `pending` build does that anyway.
+    pub relayout: bool,
+}
+
+/// What is folded away. Keys are `stable_key`s.
+#[derive(Clone, Default)]
+pub struct Folds {
+    /// Containers the user closed.
+    pub collapsed: FxHashSet<u64>,
+    /// Focus mode: only this node's neighbourhood stays open.
+    pub focus: Option<u64>,
+    /// Containers the focus would close, opened by hand.
+    pub opened: FxHashSet<u64>,
+}
+
+/// View state of the open project (see [`crate::viewstate`]).
+#[derive(Resource, Default)]
+pub struct ViewState {
+    pub root: PathBuf,
+    pub folds: Folds,
+    /// Bumped on every change of `folds`; `laid_out`: the value the latest
+    /// layout was started for.
+    pub rev: u64,
+    pub laid_out: u64,
+    /// Fly to the selection once the next layout is there (it was hidden).
+    pub fly_to_selection: bool,
+    /// Bumped when `folds.collapsed` changes — what the sidecar stores.
+    pub persist_rev: u64,
+    pub persist_seen: u64,
+    pub saved_rev: u64,
+    /// Camera `[x, y, zoom]` restored from the sidecar, until it is applied.
+    pub camera: Option<[f32; 3]>,
+    pub camera_seen: [f32; 3],
+    pub saved_camera: [f32; 3],
+    /// Last time folds or camera moved (debounces the save).
+    pub changed_at: f64,
+    /// The sidecar file exists.
+    pub sidecar: bool,
 }
 
 #[derive(Resource, Default)]

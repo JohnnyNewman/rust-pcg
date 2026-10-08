@@ -3629,6 +3629,7 @@ dependencies = [
  "pcg-lsp",
  "pcg-syntax",
  "rustc-hash 2.1.3",
+ "serde_json",
 ]
 
 [[package]]
