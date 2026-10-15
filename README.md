@@ -8,7 +8,8 @@ is a projection of it. See the project docs (*vision-and-decisions*,
 **Status: M1 (skeleton & static graph), M2 (incremental reload, animated diff,
 layered layout with edge routing, fold/unfold, focus mode, view-state sidecar) and
 M3 (in-node editing) implemented, plus one item pulled forward from M6: precise call
-edges from rust-analyzer. M4 (LLM integration) and M5 (visual debugging) have not
+edges from rust-analyzer. M4 (LLM integration): first slice — summaries and code
+from intents through a pluggable backend (Claude API). M5 (visual debugging) has not
 been started.**
 
 ![Focus on a function: callers (orange) and callees (blue) with flowing dots](docs/screenshots/focus-edges.png)
@@ -45,6 +46,8 @@ rust-analyzer`); without it, or with `--no-lsp`, edges are name-based.
 | *all edges* | aggregated call graph on the visible boxes |
 | `Enter` / inspector → *Edit* | edit the selected node's source in place, syntax-highlighted; any number of editors can be open, also several on one file. The graph follows the unsaved text live (calls, new items, the diff animation); nothing touches the disk until `Ctrl+S` (all files) / *Save*. `Esc` closes the focused editor (asks once before discarding unsaved text). If a file changes on disk under unsaved text, its editors offer *Keep mine* / *Take theirs*. |
 | inspector → *Accept & write summary* | writes a `@pcg:summary[h=…]` comment into the file (only on this explicit accept, decision 7) and reloads |
+| inspector → *Summarize (N)* | asks the model for the node's summary, children first (see *Language models*); results show as *proposed* until *Accept N proposed* writes them |
+| inspector → intent + *Generate code* | the model rewrites the node; the proposal opens as unsaved text in its editor, *Accept* saves it with an `@pcg:intent` comment, *Reject* restores the old code |
 | *(save a file in any editor)* | the project is watched: only changed files are re-parsed, and the graph animates the diff — moved boxes glide, new ones fade in (green), removed ones fade out (red), changed ones glow (yellow). Selection follows the node by identity. |
 
 ## Workspace
@@ -58,6 +61,8 @@ crates/
                arrangement, plus a route for every edge between or through containers;
                folded containers, and hints from the previous layout to stay put
   pcg-lsp/     rust-analyzer client: where is each call site's callee defined?
+  pcg-llm/     language models: Backend trait (Claude API first), bottom-up summaries
+               cached by content hash, intent → code proposals
   pcg-app/     Bevy shell + egui panels/canvas; resources = data, systems = control flow
 ```
 
@@ -174,6 +179,33 @@ your target directory, and does not see through generated code.
 
 This repo (a Bevy workspace): 3818 of 3884 call sites answered 37 s after start,
 333 name-based edges become 557 precise ones.
+
+### Language models
+
+`pcg-llm` is headless: a `Backend` trait (one blocking call, streamed text) with the
+Claude API as the first implementation (`ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN`;
+`PCG_LLM_MODEL` picks the model, default `claude-opus-5-5`). `PCG_LLM_BACKEND=demo`
+answers with canned text, so the whole flow can be tried offline.
+
+*Summaries* are lazy and bottom-up. Asked for one node, the planner lists every node
+in its subtree that has neither a fresh `@pcg:summary` nor a cached one, and gives each
+a height (leaves 1, containers 1 + their highest planned child). Heights run in order,
+up to 4 requests at a time within one; a container's prompt carries its children's
+summaries (plus its code if it is small), so a big module is summarized from its parts.
+Results are cached under `(kind, content_hash)` in `<project>/.pcg/summaries.json`:
+an edit misses exactly the nodes whose code changed. Boxes show a request in flight as
+a spark running round them, an arrival as a ring opening out; containers with work
+inside pulse. Nothing reaches the source until *Accept*.
+
+*Intent → code*: the prompt carries the node's code and, as signature + summary, the
+other items of its container, its callees and its callers. The answer becomes new
+text for the node's span, `@pcg:intent` on top (other `@pcg` lines stripped). It
+opens as unsaved text in the node's editor — so the live graph and the diff animation
+show what it would change — and is refused if the code moved on meanwhile.
+
+```sh
+cargo run -p pcg-llm --example summarize -- <dir> <item> [--write-cache]
+```
 
 ### `@pcg` comments
 
