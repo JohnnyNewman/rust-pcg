@@ -30,5 +30,5 @@ pub use assemble::{BuildStats, build_graph, build_graph_cached, build_graph_over
 pub use cache::{Overlays, ParseCache};
 pub use diff::{GraphDiff, diff};
 pub use edit::{Buffer, Hl, ItemPath};
-pub use pcg_comment::{TextEdit, short_hash, summary_edit};
+pub use pcg_comment::{TextEdit, apply_edits, format_intent, short_hash, strip_tags, summary_edit};
 pub use resolve::{Precise, node_at, text_hash};

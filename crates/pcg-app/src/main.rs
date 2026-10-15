@@ -9,6 +9,7 @@
 //! |-------------------|------------------------|-----------------------------------------|
 //! | `watch::poll`     | Update                 | `Watch` → `LoadRequest` (debounced)     |
 //! | `edit::poll`      | Update                 | `Editing` → `LoadRequest` (debounced live rebuild) |
+//! | `llm::drive`      | Update                 | `Project`, worker threads ⇄ `Llm` → `Editing` (proposals) |
 //! | `lsp::drive`      | Update                 | `Project`, worker thread ⇄ `Lsp` → `LoadRequest` (answers arrived) |
 //! | `viewstate::poll` | Update                 | `ViewState`, `View` → `LoadRequest` (relayout), the sidecar file |
 //! | `load::start`     | Update                 | `LoadRequest`, `Cache`, `Editing` (overlay), `Lsp` (answers), `ViewState` → `LoadTask` |
@@ -20,6 +21,7 @@
 mod anim;
 mod canvas;
 mod edit;
+mod llm;
 mod load;
 mod lsp;
 mod model;
@@ -62,11 +64,22 @@ fn main() {
         .init_resource::<Watch>()
         .init_resource::<Editing>()
         .init_resource::<ViewState>()
+        .init_resource::<llm::Llm>()
         .insert_resource(Lsp { enabled: !no_lsp, ..default() })
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (watch::poll, edit::poll, lsp::drive, viewstate::poll, load::start, load::poll, anim::end, view::animate)
+            (
+                watch::poll,
+                edit::poll,
+                llm::drive,
+                lsp::drive,
+                viewstate::poll,
+                load::start,
+                load::poll,
+                anim::end,
+                view::animate,
+            )
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, ui::ui)

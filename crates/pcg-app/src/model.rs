@@ -245,6 +245,8 @@ pub struct Editor {
     pub focused: bool,
     /// Esc was pressed once on unsaved text.
     pub discard_armed: bool,
+    /// The text is a generated proposal; this is what it replaced (Reject puts it back).
+    pub proposal: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -268,6 +270,13 @@ pub struct UiState {
     pub draft_for: NodeId,
     pub status: String,
     pub themed: bool,
+    /// The summary draft is what was filled in (not typed): it may follow new proposals.
+    pub draft_auto: bool,
+    pub intent_draft: String,
+    pub intent_for: NodeId,
+    /// Counts for the inspector's LLM section, for `(snapshot, node, cache size)`:
+    /// summaries to write, proposals to accept.
+    pub llm_counts: (usize, NodeId, usize, usize, usize),
 }
 
 /// Per-frame scratch buffers for the canvas (kept to avoid reallocation).

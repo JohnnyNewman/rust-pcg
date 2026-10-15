@@ -89,7 +89,6 @@ impl Doc {
     }
 
     /// Set editor `i`'s text, as typing would.
-    #[cfg(test)]
     fn type_into(&mut self, i: usize, text: &str, now: f64) {
         let mut e = self.editors.remove(i);
         e.draft = text.to_string();
@@ -139,6 +138,7 @@ impl Doc {
             e.job = highlight(buffer, &span, &e.draft);
             e.span = span;
             e.discard_armed = false;
+            e.proposal = None;
             true
         });
     }
@@ -191,7 +191,30 @@ pub fn open(ed: &mut Editing, p: &Loaded, n: NodeId) -> Result<(), &'static str>
         want_focus: true,
         focused: false,
         discard_armed: false,
+        proposal: None,
     });
+    Ok(())
+}
+
+/// Show a generated rewrite as unsaved text in the node's editor (opened if
+/// needed). The graph then follows it like typing; Accept saves, Reject puts
+/// the old text back.
+pub fn propose(ed: &mut Editing, p: &Loaded, prop: &pcg_llm::Proposal, now: f64) -> Result<(), String> {
+    let g = &p.graph;
+    let n = crate::llm::find(g, prop.node_key);
+    let current = n.is_some()
+        && g.nodes.bytes[n.idx()].range() == prop.span
+        && pcg_syntax::text_hash(&g.files.source[g.nodes.file[n.idx()].idx()]) == prop.file_hash;
+    if !current {
+        return Err("the code changed while the model was writing — ask again".into());
+    }
+    open(ed, p, n)?;
+    let doc = ed.docs.iter_mut().find(|d| d.path == prop.file).ok_or("file not open")?;
+    let i = doc.editors.iter().position(|e| e.span == prop.span).ok_or("editor not open")?;
+    doc.type_into(i, &prop.new, now);
+    let e = &mut doc.editors[i];
+    e.proposal.get_or_insert_with(|| prop.old.clone());
+    e.want_focus = true;
     Ok(())
 }
 
@@ -311,6 +334,7 @@ pub fn editors(
             // Closing the last view of unsaved text throws it away.
             let discards = doc.dirty && doc.editors.is_empty();
             let mut close = false;
+            let mut reject = false;
             let had_focus = e.focused;
 
             egui::Area::new(egui::Id::new(("pcg-editor", e.id)))
@@ -320,6 +344,10 @@ pub fn editors(
                 .show(ctx, |ui| {
                     let border = if doc.conflict {
                         theme::DIFF_EXIT
+                    } else if e.proposal.is_some() {
+                        // A proposal breathes until it is decided on.
+                        let t = (now * 2.4).sin() as f32 * 0.5 + 0.5;
+                        theme::INTENT.gamma_multiply(0.55 + 0.45 * t)
                     } else if doc.dirty {
                         theme::DIFF_CHANGE
                     } else {
@@ -370,6 +398,19 @@ pub fn editors(
                                         action = Some(DocAction::KeepMine);
                                     }
                                     ui.label(RichText::new("changed on disk").small().color(theme::DIFF_EXIT));
+                                } else if e.proposal.is_some() {
+                                    if ui
+                                        .button(RichText::new("Accept").color(theme::DIFF_ENTER))
+                                        .on_hover_text("Save the proposal (with its @pcg:intent) to the file")
+                                        .clicked()
+                                    {
+                                        action = Some(DocAction::Save);
+                                    }
+                                    reject |= ui
+                                        .button(RichText::new("Reject").color(theme::DIFF_EXIT))
+                                        .on_hover_text("Put the old code back")
+                                        .clicked();
+                                    ui.label(RichText::new("proposal").small().color(theme::INTENT));
                                 } else if ui
                                     .add_enabled(doc.dirty, egui::Button::new("Save"))
                                     .on_hover_text("Ctrl+S saves all files")
@@ -413,6 +454,17 @@ pub fn editors(
                     });
                 });
 
+            if reject && let Some(old) = e.proposal.take() {
+                doc.sync(&mut e.span, &old, now);
+                e.draft = old;
+                e.synced = e.draft.clone();
+                e.job = highlight(&doc.buffer, &e.span, &e.draft);
+                st.status = "proposal rejected".into();
+                if !doc.dirty {
+                    reload = true;
+                    continue;
+                }
+            }
             // Esc on the last view of unsaved text asks once before throwing it away.
             let esc = esc && had_focus;
             if esc && discards && !e.discard_armed {
@@ -442,6 +494,7 @@ pub fn editors(
         };
         match done {
             Ok(msg) => {
+                doc.editors.iter_mut().for_each(|e| e.proposal = None);
                 st.status = msg;
                 doc.graph_stale = false;
                 reload = true;
@@ -592,5 +645,53 @@ mod tests {
         assert!(doc.dirty);
         doc.type_into(0, "fn a() { mine(); }", 0.0);
         assert!(!doc.dirty);
+    }
+
+    #[test]
+    fn proposal_accept_and_reject() {
+        let root = project("propose", "fn a() {}\r\n\r\nfn b() {\r\n    1;\r\n}\r\n");
+        let cache = Arc::default();
+        let build = |ed: &Editing, prev| {
+            crate::load::build(root.clone(), Arc::clone(&cache), overlays(ed), None, prev, Folds::default(), 0)
+        };
+        let p0 = Arc::new(build(&Editing::default(), None));
+        let b = find(&p0, "b");
+        let answer = "```rust\nfn b() {\n    a();\n}\n```";
+        let backend = pcg_llm::Scripted(move |_: &pcg_llm::Request| Ok(answer.to_string()));
+        let sc = pcg_llm::SummaryCache::default();
+        let prop = pcg_llm::generate::generate(&backend, &p0.graph, &sc, b, "Call a.", &mut |_| true).unwrap();
+
+        // The proposal is unsaved text in b's editor; the graph follows it.
+        let mut ed = Editing::default();
+        propose(&mut ed, &p0, &prop, 1.0).unwrap();
+        let e = &ed.docs[0].editors[0];
+        assert_eq!(e.draft, "/// @pcg:intent Call a.\nfn b() {\n    a();\n}");
+        assert_eq!(e.proposal.as_deref(), Some("fn b() {\n    1;\n}"));
+        let p1 = Arc::new(build(&ed, Some(p0.clone())));
+        assert_eq!(rebind(&mut ed, &p1), 0);
+        let b1 = find(&p1, "b");
+        assert_eq!(p1.graph.edges.out.of(b1).len(), 1, "the new call shows before anything is saved");
+        let disk = root.join("src/lib.rs");
+        assert!(!fs::read_to_string(&disk).unwrap().contains("a();"));
+
+        // A stale proposal (the code moved on) is refused.
+        assert!(propose(&mut Editing::default(), &p1, &prop, 2.0).is_err());
+
+        // Reject: the old text is back, nothing was written.
+        let doc = &mut ed.docs[0];
+        let mut e = doc.editors.remove(0);
+        let old = e.proposal.take().unwrap();
+        doc.sync(&mut e.span, &old, 3.0);
+        doc.editors.insert(0, e);
+        assert!(!doc.dirty);
+
+        // Accept = save: the intent is in the file, with its CRLF line endings.
+        propose(&mut ed, &p0, &prop, 4.0).unwrap();
+        ed.docs[0].save().unwrap();
+        let text = fs::read_to_string(&disk).unwrap();
+        assert_eq!(text, "fn a() {}\r\n\r\n/// @pcg:intent Call a.\r\nfn b() {\r\n    a();\r\n}\r\n");
+        let p2 = build(&Editing::default(), None);
+        let b2 = find(&p2, "b");
+        assert_eq!(p2.graph.comments.text(p2.graph.nodes.intent[b2.idx()]), "Call a.");
     }
 }

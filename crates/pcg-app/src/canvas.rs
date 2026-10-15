@@ -48,6 +48,7 @@ pub fn canvas(
     sel: &Selection,
     st: &UiState,
     scratch: &mut CanvasScratch,
+    llm: &crate::llm::Llm,
     now: f64,
 ) -> CanvasOut {
     let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
@@ -93,6 +94,17 @@ pub fn canvas(
     let since_load = (now - loaded_at) as f32;
     let pulse = 0.5 + 0.5 * ((now - sel.changed_at) as f32 * 4.0).sin();
 
+    // The language model at work: the nodes it is writing for, and every box
+    // around them (so it can be found from any zoom).
+    let cache = llm.cache();
+    let mut busy_around = rustc_hash::FxHashSet::default();
+    for &k in llm.asking.keys() {
+        let b = crate::llm::find(g, k);
+        if b.is_some() {
+            busy_around.extend(g.nodes.ancestors(b).map(|a| a.0));
+        }
+    }
+
     let mut tabs: Vec<(Rect, NodeId, f32)> = Vec::new();
     let mut i = 0usize;
     while i < n {
@@ -131,7 +143,7 @@ pub fn canvas(
         let own = alpha * (1.0 - (1.0 - DIMMED) * dim);
 
         let mut tab = 0.0;
-        draw_node(&painter, g, id, r, own, has_children, show_children, closed, st.face, view.zoom, &mut tab);
+        draw_node(&painter, g, &cache, id, r, own, has_children, show_children, closed, st.face, view.zoom, &mut tab);
         if tab > 0.01 {
             tabs.push((r, id, tab));
         }
@@ -152,6 +164,35 @@ pub fn canvas(
                 Stroke::new(1.0 + 1.5 * f, c.gamma_multiply(0.9 * f)),
                 StrokeKind::Outside,
             );
+        }
+
+        if !llm.asking.is_empty() || !llm.arrived.is_empty() {
+            let key = g.nodes.stable_key[i];
+            if let Some(&t0) = llm.asking.get(&key) {
+                draw_thinking(&painter, r, (now - t0) as f32, own);
+            } else if busy_around.contains(&(i as u32)) {
+                let a = 0.25 + 0.2 * ((now * 3.0) as f32).sin();
+                painter.rect_stroke(
+                    r.expand(2.0),
+                    CornerRadius::same(6),
+                    Stroke::new(1.0, theme::INTENT.gamma_multiply(a * own)),
+                    StrokeKind::Outside,
+                );
+            }
+            if let Some(&t0) = llm.arrived.get(&key) {
+                // Just arrived: a ring opens out and fades.
+                let t = ((now - t0) / 0.9) as f32;
+                if t < 1.0 {
+                    let e = 1.0 - (1.0 - t).powi(3);
+                    painter.rect_stroke(
+                        r.expand(1.0 + 12.0 * e),
+                        CornerRadius::same(6),
+                        Stroke::new(2.0 * (1.0 - t), theme::INTENT.gamma_multiply((1.0 - t) * own)),
+                        StrokeKind::Outside,
+                    );
+                    painter.rect_filled(r, CornerRadius::same(5), theme::INTENT.gamma_multiply(0.15 * (1.0 - t) * own));
+                }
+            }
         }
 
         if id == sel.selected {
@@ -273,6 +314,7 @@ fn draw_grid(painter: &Painter, view: &View, rect: Rect) {
 fn draw_node(
     painter: &Painter,
     g: &Graph,
+    cache: &pcg_llm::SummaryCache,
     id: NodeId,
     r: Rect,
     alpha: f32,
@@ -378,6 +420,11 @@ fn draw_node(
         painter.circle_filled(Pos2::new(bx, by), 3.5, c.gamma_multiply(label_a));
         bx -= 10.0;
     }
+    if st != SummaryState::Fresh && cache.get(g, id).is_some() {
+        // A proposed summary waits to be accepted.
+        painter.circle_stroke(Pos2::new(bx, by), 3.0, Stroke::new(1.2, theme::ACCENT.gamma_multiply(0.8 * label_a)));
+        bx -= 10.0;
+    }
     if g.nodes.intent[i].is_some() {
         painter.circle_stroke(Pos2::new(bx, by), 3.5, Stroke::new(1.5, theme::INTENT.gamma_multiply(label_a)));
     }
@@ -402,7 +449,7 @@ fn draw_node(
             let clip = painter.with_clip_rect(body.intersect(painter.clip_rect()));
             match face {
                 Face::Code => draw_code(&clip, g, id, body, line_px, a),
-                Face::Summary => draw_summary(&clip, g, id, body, line_px, a),
+                Face::Summary => draw_summary(&clip, g, cache, id, body, line_px, a),
             }
         }
     }
@@ -419,17 +466,61 @@ fn draw_code(painter: &Painter, g: &Graph, id: NodeId, body: Rect, line_px: f32,
     }
 }
 
-fn draw_summary(painter: &Painter, g: &Graph, id: NodeId, body: Rect, line_px: f32, a: f32) {
+fn draw_summary(
+    painter: &Painter,
+    g: &Graph,
+    cache: &pcg_llm::SummaryCache,
+    id: NodeId,
+    body: Rect,
+    line_px: f32,
+    a: f32,
+) {
     let i = id.idx();
     let (text, color) = if g.nodes.intent[i].is_some() {
         (g.comments.text(g.nodes.intent[i]).to_string(), theme::INTENT)
     } else if g.nodes.summary[i].is_some() {
         (g.comments.text(g.nodes.summary[i]).to_string(), theme::summary_state(g.nodes.summary_state[i]).0)
+    } else if let Some(s) = cache.get(g, id) {
+        (format!("proposed: {s}"), theme::TEXT_DIM)
     } else {
         ("no summary yet".to_string(), theme::TEXT_DIM)
     };
     let galley = painter.layout(text, FontId::proportional(line_px), color.gamma_multiply(a), body.width());
     painter.galley(body.min + Vec2::new(0.0, line_px * 0.2), galley, color);
+}
+
+/// A request for this node is in flight: a spark runs around the box with a
+/// fading tail, over a softly breathing outline. `t`: seconds since it started.
+fn draw_thinking(painter: &Painter, r: Rect, t: f32, alpha: f32) {
+    let breathe = 0.35 + 0.25 * (t * 3.0).sin();
+    painter.rect_stroke(
+        r.expand(1.5),
+        CornerRadius::same(6),
+        Stroke::new(1.2, theme::INTENT.gamma_multiply(breathe * alpha)),
+        StrokeKind::Outside,
+    );
+    let r = r.expand(1.5);
+    let (w, h) = (r.width(), r.height());
+    let perimeter = 2.0 * (w + h);
+    // Constant on-screen speed, at least one lap every 2.5 s.
+    let speed = (perimeter / 2.5).max(160.0);
+    let at = |d: f32| {
+        let d = d.rem_euclid(perimeter);
+        if d < w {
+            Pos2::new(r.min.x + d, r.min.y)
+        } else if d < w + h {
+            Pos2::new(r.max.x, r.min.y + d - w)
+        } else if d < 2.0 * w + h {
+            Pos2::new(r.max.x - (d - w - h), r.max.y)
+        } else {
+            Pos2::new(r.min.x, r.max.y - (d - 2.0 * w - h))
+        }
+    };
+    let head = t * speed;
+    for k in 0..10 {
+        let f = 1.0 - k as f32 / 10.0;
+        painter.circle_filled(at(head - k as f32 * 5.0), 0.8 + 1.8 * f, theme::INTENT.gamma_multiply(f * alpha));
+    }
 }
 
 /// Screen rect of a node (tweened while a transition runs).

@@ -14,6 +14,7 @@ pcg-core.workspace = true
 pcg-syntax.workspace = true
 pcg-layout.workspace = true
 pcg-lsp.workspace = true
+pcg-llm.workspace = true
 bevy.workspace = true
 bevy_egui.workspace = true
 rustc-hash.workspace = true

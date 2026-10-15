@@ -1,0 +1,14 @@
+[package]
+name = "pcg-llm"
+description = "LLM integration of the pcg IDE: pluggable backend trait (Claude API first), bottom-up summaries cached by content hash, code generation from intents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pcg-core.workspace = true
+pcg-syntax.workspace = true
+rustc-hash.workspace = true
+serde_json.workspace = true
+xxhash-rust.workspace = true
+ureq.workspace = true

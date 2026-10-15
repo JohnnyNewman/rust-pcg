@@ -82,8 +82,19 @@ impl TextEdit {
 
 /// Render a summary comment block, wrapped to `width` columns.
 pub fn format_summary(prefix: &str, indent: &str, hash: u64, text: &str, width: usize) -> String {
+    format_tag(prefix, indent, &format!("@pcg:summary[h={:06x}]", short_hash(hash)), text, width)
+}
+
+/// Render an intent comment block, wrapped to `width` columns.
+pub fn format_intent(prefix: &str, indent: &str, text: &str, width: usize) -> String {
+    format_tag(prefix, indent, "@pcg:intent", text, width)
+}
+
+/// `{indent}{prefix} {tag} text…`, continuation lines indented two spaces
+/// past the prefix (what [`parse_doc_lines`] reads back as one comment).
+fn format_tag(prefix: &str, indent: &str, tag: &str, text: &str, width: usize) -> String {
     let mut out = String::new();
-    let mut line = format!("{indent}{prefix} @pcg:summary[h={:06x}]", short_hash(hash));
+    let mut line = format!("{indent}{prefix} {tag}");
     let cont = format!("{indent}{prefix}   ");
     let mut fresh_line = false;
     for word in text.split_whitespace() {
@@ -101,6 +112,41 @@ pub fn format_summary(prefix: &str, indent: &str, hash: u64, text: &str, width: 
     }
     out.push_str(&line);
     out.push('\n');
+    out
+}
+
+/// Apply several non-overlapping edits of one file at once (back to front,
+/// so earlier ranges stay valid). Inserts at the same place keep their order
+/// in `edits` (a file module's `//!` before its first item's `///`).
+pub fn apply_edits(src: &str, edits: &[&TextEdit]) -> String {
+    let mut order: Vec<(usize, &TextEdit)> = edits.iter().copied().enumerate().collect();
+    order.sort_by_key(|&(k, e)| std::cmp::Reverse((e.range.start, k)));
+    let mut s = src.to_string();
+    for (_, e) in order {
+        s.replace_range(e.range.range(), &e.text);
+    }
+    s
+}
+
+/// Remove every `@pcg:` tag (with its continuation lines) from doc comments
+/// in `code` — for code that comes back from a generator and must not carry
+/// stale or invented summaries.
+pub fn strip_tags(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut in_tag = false;
+    for line in code.split_inclusive('\n') {
+        let t = line.trim_start();
+        let body = t.strip_prefix("///").or_else(|| t.strip_prefix("//!"));
+        match body {
+            Some(b) if b.trim_start().starts_with("@pcg:") => {
+                in_tag = true;
+                continue;
+            }
+            Some(b) if in_tag && b.starts_with("  ") && !b.trim().is_empty() => continue,
+            _ => in_tag = false,
+        }
+        out.push_str(line);
+    }
     out
 }
 
@@ -168,6 +214,35 @@ mod tests {
         assert_eq!(c[0].bytes, Span::new(10, 29));
         assert_eq!(c[1].kind, CommentKind::Intent);
         assert_eq!(c[1].stored_hash, None);
+    }
+
+    #[test]
+    fn strip_and_apply() {
+        let code = "/// Docs.
+/// @pcg:summary[h=000001] Old,
+///   older.
+/// @pcg:intent X
+fn a() {}
+";
+        assert_eq!(
+            strip_tags(code),
+            "/// Docs.
+fn a() {}
+"
+        );
+        let f = FileId::from_idx(0);
+        let e1 = TextEdit { file: f, range: Span::new(0, 1), text: "AA".into() };
+        let e2 = TextEdit { file: f, range: Span::new(3, 3), text: "-".into() };
+        assert_eq!(apply_edits("abcd", &[&e1, &e2]), "AAbc-d");
+        let i1 = TextEdit { file: f, range: Span::new(0, 0), text: "1".into() };
+        let i2 = TextEdit { file: f, range: Span::new(0, 0), text: "2".into() };
+        assert_eq!(apply_edits("x", &[&i1, &i2]), "12x");
+        let i = format_intent("///", "  ", "Do it.", 100);
+        assert_eq!(
+            i,
+            "  /// @pcg:intent Do it.
+"
+        );
     }
 
     #[test]

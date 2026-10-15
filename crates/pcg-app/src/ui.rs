@@ -24,6 +24,7 @@ pub fn ui(
     mut editing: ResMut<Editing>,
     mut vs: ResMut<ViewState>,
     lsp: Res<Lsp>,
+    mut llm: ResMut<crate::llm::Llm>,
     time: Res<Time>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -44,6 +45,7 @@ pub fn ui(
     // View-state requests: fold / unfold a container, focus on a node (`NONE`: leave focus).
     let mut fold: Option<NodeId> = None;
     let mut focus: Option<NodeId> = None;
+    let mut llm_act: Option<crate::llm::Act> = None;
 
     // ---- top bar -----------------------------------------------------------
     egui::Panel::top("top").show(&mut root, |ui| {
@@ -170,7 +172,21 @@ pub fn ui(
     {
         egui::Panel::right("inspector").default_size(380.0).show(&mut root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                inspector(ui, p, &mut sel, &mut st, &mut req, &mut select, &mut fly, &mut edit, &mut fold, &mut focus);
+                inspector(
+                    ui,
+                    p,
+                    &mut sel,
+                    &mut st,
+                    &mut req,
+                    &mut select,
+                    &mut fly,
+                    &mut edit,
+                    &mut fold,
+                    &mut focus,
+                    &llm,
+                    &mut llm_act,
+                    now,
+                );
             });
         });
     }
@@ -179,7 +195,7 @@ pub fn ui(
     egui::CentralPanel::no_frame().show(&mut root, |ui| {
         if let Some(p) = &data {
             let anim = crate::anim::Anim::new(p, &tr, now);
-            let out = canvas(ui, p, anim.as_ref(), project.loaded_at, &mut view, &sel, &st, &mut scratch, now);
+            let out = canvas(ui, p, anim.as_ref(), project.loaded_at, &mut view, &sel, &st, &mut scratch, &llm, now);
             sel.hovered = out.hovered;
             if let Some(c) = out.clicked {
                 select = Some(c);
@@ -235,6 +251,9 @@ pub fn ui(
                     fly = Some(parent);
                 }
             }
+        }
+        if let Some(a) = llm_act.take() {
+            crate::llm::act(&mut llm, p, a, &mut req, now);
         }
         // ---- in-node editor ---------------------------------------------------
         if let Some(n) = edit {
@@ -344,6 +363,9 @@ fn inspector(
     edit: &mut Option<NodeId>,
     fold: &mut Option<NodeId>,
     focus: &mut Option<NodeId>,
+    llm: &crate::llm::Llm,
+    llm_act: &mut Option<crate::llm::Act>,
+    now: f64,
 ) {
     let g = &p.graph;
     let n = sel.selected;
@@ -405,21 +427,35 @@ fn inspector(
     }
 
     if kind.is_summarizable() && g.nodes.file[i].is_some() {
+        // Filled in with the summary in the code, or a proposed one — and kept
+        // following proposals until the user types.
+        let proposed = llm.proposed(g, n);
         if st.draft_for != n {
             st.draft_for = n;
-            st.summary_draft = if g.nodes.summary[i].is_some() {
-                g.comments.text(g.nodes.summary[i]).to_string()
-            } else {
-                String::new()
-            };
+            st.draft_auto = true;
+            st.summary_draft = String::new();
+        }
+        if st.draft_auto {
+            let fill = proposed
+                .clone()
+                .or_else(|| g.nodes.summary[i].is_some().then(|| g.comments.text(g.nodes.summary[i]).to_string()));
+            st.summary_draft = fill.unwrap_or_default();
+        }
+        if let Some(s) = &proposed
+            && *s == st.summary_draft
+        {
+            ui.label(RichText::new("proposed by the model — not in the code yet").small().color(theme::ACCENT));
         }
         ui.add_space(4.0);
-        ui.add(
+        let r = ui.add(
             egui::TextEdit::multiline(&mut st.summary_draft)
                 .hint_text("Write a summary…")
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
+        if r.changed() {
+            st.draft_auto = false;
+        }
         let verb = if g.nodes.summary_state[i] == SummaryState::Stale {
             "Accept & refresh hash"
         } else {
@@ -439,6 +475,7 @@ fn inspector(
             }
         }
     }
+    llm_section(ui, p, n, st, llm, llm_act, now);
     ui.separator();
 
     // Edges.
@@ -489,6 +526,134 @@ fn inspector(
                 });
             });
         });
+    }
+}
+
+/// Summaries and code from the language model, for the selected node.
+fn llm_section(
+    ui: &mut Ui,
+    p: &Loaded,
+    n: NodeId,
+    st: &mut UiState,
+    llm: &crate::llm::Llm,
+    act: &mut Option<crate::llm::Act>,
+    now: f64,
+) {
+    use crate::llm::Act;
+    let g = &p.graph;
+    let i = n.idx();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("model").strong().color(theme::INTENT));
+        if let Some(b) = &llm.backend {
+            ui.label(RichText::new(b.name()).small().monospace().color(theme::TEXT_DIM));
+        }
+    });
+    if llm.backend.is_none() {
+        ui.label(RichText::new(&llm.missing).small().color(theme::TEXT_DIM));
+        ui.label(RichText::new("(PCG_LLM_BACKEND=demo tries it without a key)").small().color(theme::TEXT_DIM));
+        return;
+    }
+
+    // Summaries: what this node's summary still needs, and what waits to be accepted.
+    let id = p as *const Loaded as usize;
+    let size = llm.cache().entries.len();
+    if st.llm_counts.0 != id || st.llm_counts.1 != n || st.llm_counts.2 != size {
+        let plan = llm.plan(g, n).len();
+        let proposed = crate::llm::proposed_in(g, &llm.cache(), n);
+        st.llm_counts = (id, n, size, plan, proposed);
+    }
+    let (_, _, _, to_write, proposed) = st.llm_counts;
+    ui.horizontal_wrapped(|ui| {
+        if let Some(run) = &llm.run {
+            ui.spinner();
+            ui.label(format!("summaries {}/{}", run.done + run.failed, run.total));
+            if ui.button("Cancel").clicked() {
+                *act = Some(Act::Cancel);
+            }
+        } else if to_write > 0 {
+            let label = if to_write == 1 { "Summarize".to_string() } else { format!("Summarize ({to_write})") };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Ask the model for this node's summary — children first, bottom-up, only for what has none yet. \
+                     Cached by content hash in .pcg/summaries.json; nothing goes into the code until you accept.",
+                )
+                .clicked()
+            {
+                *act = Some(Act::Summarize(n, false));
+            }
+        } else if g.nodes.kind[i].is_summarizable()
+            && ui.button("Summarize again").on_hover_text("Ask for a new summary of this node").clicked()
+        {
+            *act = Some(Act::Summarize(n, true));
+        }
+        if proposed > 0
+            && llm.run.is_none()
+            && ui
+                .button(format!("Accept {proposed} proposed"))
+                .on_hover_text("Write every proposed summary in this subtree into the code as @pcg:summary comments")
+                .clicked()
+        {
+            *act = Some(Act::Write(n));
+        }
+    });
+
+    // Intent → code.
+    if g.nodes.kind[i].is_summarizable() && g.nodes.file[i].is_some() {
+        if st.intent_for != n {
+            st.intent_for = n;
+            st.intent_draft = if g.nodes.intent[i].is_some() {
+                g.comments.text(g.nodes.intent[i]).to_string()
+            } else {
+                String::new()
+            };
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut st.intent_draft)
+                .hint_text("Intent: what should this do?")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let key = g.nodes.stable_key[i];
+        match &llm.generating {
+            Some(gen_) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let what = if gen_.node_key == key { "writing" } else { "writing another node" };
+                    ui.label(format!("{what}… {:.0} s", now - gen_.started));
+                    if ui.button("Cancel").clicked() {
+                        *act = Some(Act::Cancel);
+                    }
+                });
+                if gen_.node_key == key && !gen_.text.is_empty() {
+                    // The answer as it streams in: its last lines.
+                    let lines: Vec<&str> = gen_.text.lines().collect();
+                    let tail = lines[lines.len().saturating_sub(14)..].join("\n");
+                    egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(tail).monospace().size(10.5).color(theme::TEXT_DIM))
+                                .extend(),
+                        );
+                    });
+                }
+            }
+            None => {
+                if ui
+                    .add_enabled(!st.intent_draft.trim().is_empty(), egui::Button::new("Generate code"))
+                    .on_hover_text(
+                        "Rewrite this node from the intent. The result opens as unsaved text in its editor: the graph \
+                         shows the change, Accept saves it with the intent as a @pcg:intent comment, Reject undoes it.",
+                    )
+                    .clicked()
+                {
+                    *act = Some(Act::Generate(n, st.intent_draft.trim().to_string()));
+                }
+            }
+        }
+    }
+    if !llm.status.is_empty() {
+        ui.label(RichText::new(&llm.status).small().color(theme::TEXT_DIM));
     }
 }
 
