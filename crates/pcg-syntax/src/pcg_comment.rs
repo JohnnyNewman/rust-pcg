@@ -162,7 +162,7 @@ fn line_end_incl(src: &str, at: usize) -> usize {
 /// *current* content hash. Per decision 7 this is only applied on save/accept.
 pub fn summary_edit(g: &Graph, node: NodeId, text: &str) -> Option<TextEdit> {
     let file = g.nodes.file[node.idx()];
-    if file.is_none() || !g.nodes.kind[node.idx()].is_summarizable() {
+    if !g.summarizable(node) {
         return None;
     }
     let src: &str = &g.files.source[file.idx()];

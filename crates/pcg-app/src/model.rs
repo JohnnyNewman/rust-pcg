@@ -247,6 +247,9 @@ pub struct Editor {
     pub discard_armed: bool,
     /// The text is a generated proposal; this is what it replaced (Reject puts it back).
     pub proposal: Option<String>,
+    /// The proposal item by item (see [`pcg_llm::hunks`]), for the draft whose hash is `hunks_of`.
+    pub hunks: Vec<pcg_llm::hunks::Hunk>,
+    pub hunks_of: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

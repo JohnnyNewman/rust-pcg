@@ -21,6 +21,7 @@ pub mod backend;
 pub mod cache;
 pub mod claude;
 pub mod generate;
+pub mod hunks;
 pub mod summarize;
 
 pub use backend::{Backend, Completion, Effort, Error, Request, Scripted};

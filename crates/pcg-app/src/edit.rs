@@ -192,6 +192,8 @@ pub fn open(ed: &mut Editing, p: &Loaded, n: NodeId) -> Result<(), &'static str>
         focused: false,
         discard_armed: false,
         proposal: None,
+        hunks: Vec::new(),
+        hunks_of: 0,
     });
     Ok(())
 }
@@ -335,6 +337,7 @@ pub fn editors(
             let discards = doc.dirty && doc.editors.is_empty();
             let mut close = false;
             let mut reject = false;
+            let mut revert_hunk: Option<usize> = None;
             let had_focus = e.focused;
 
             egui::Area::new(egui::Id::new(("pcg-editor", e.id)))
@@ -420,6 +423,34 @@ pub fn editors(
                                 }
                             });
                         });
+                        // A proposal that touches several items: keep or undo each one.
+                        if let Some(old) = &e.proposal {
+                            let h = pcg_syntax::text_hash(&e.draft);
+                            if e.hunks_of != h {
+                                e.hunks = pcg_llm::hunks::hunks(old, &e.draft);
+                                e.hunks_of = h;
+                            }
+                            if e.hunks.len() > 1 {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("changes:").small().color(theme::TEXT_DIM));
+                                    for (k, hk) in e.hunks.iter().enumerate() {
+                                        use pcg_llm::hunks::Change;
+                                        let (sign, c) = match hk.change {
+                                            Change::Changed => ("~", theme::DIFF_CHANGE),
+                                            Change::Added => ("+", theme::DIFF_ENTER),
+                                            Change::Removed => ("-", theme::DIFF_EXIT),
+                                        };
+                                        let b = egui::Button::new(
+                                            RichText::new(format!("{sign} {}", hk.label)).small().color(c),
+                                        )
+                                        .stroke(egui::Stroke::new(1.0, c.gamma_multiply(0.5)));
+                                        if ui.add(b).on_hover_text("Undo this change, keep the others").clicked() {
+                                            revert_hunk = Some(k);
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
                             // The layouter sees every text change first: it applies the change
                             // to the buffer, so the colours always belong to the text shown.
@@ -454,6 +485,20 @@ pub fn editors(
                     });
                 });
 
+            if let Some(k) = revert_hunk
+                && let Some(old) = e.proposal.clone()
+            {
+                match pcg_llm::hunks::revert(&old, &e.draft, &e.hunks[k]) {
+                    Some(text) => {
+                        doc.sync(&mut e.span, &text, now);
+                        st.status = format!("undid {}", e.hunks[k].label);
+                        e.draft = text;
+                        e.synced = e.draft.clone();
+                        e.job = highlight(&doc.buffer, &e.span, &e.draft);
+                    }
+                    None => st.status = format!("could not undo {} on its own", e.hunks[k].label),
+                }
+            }
             if reject && let Some(old) = e.proposal.take() {
                 doc.sync(&mut e.span, &old, now);
                 e.draft = old;

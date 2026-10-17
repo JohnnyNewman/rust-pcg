@@ -84,11 +84,11 @@ pub fn request(g: &Graph, cache: &SummaryCache, n: NodeId, intent: &str) -> Requ
         g.strings.resolve(g.files.rel_path[f.idx()]),
         intent.trim(),
     );
-    if kind == NodeKind::FileModule {
+    if is_whole_file(g, n) {
         p.push_str("\nThis is the whole file: reply with the whole new file.\n");
     }
     let parent = g.nodes.parent[i];
-    if parent.is_some() && g.nodes.kind[parent.idx()].is_summarizable() {
+    if parent.is_some() && g.nodes.kind[parent.idx()] != NodeKind::Workspace {
         let sib: Vec<NodeId> = g.nodes.children(parent).filter(|&c| c != n).collect();
         list(g, cache, &mut p, &format!("Other items in `{}`", g.qualified_name(parent)), &sib);
     }
@@ -166,8 +166,7 @@ pub fn generate(
     intent: &str,
     on_text: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Proposal, Error> {
-    let i = n.idx();
-    if g.nodes.file[i].is_none() || !g.nodes.kind[i].is_summarizable() {
+    if !g.summarizable(n) {
         return Err(Error::Config("this node has no code of its own to rewrite".into()));
     }
     if intent.trim().is_empty() {

@@ -201,7 +201,9 @@ inside pulse. Nothing reaches the source until *Accept*.
 other items of its container, its callees and its callers. The answer becomes new
 text for the node's span, `@pcg:intent` on top (other `@pcg` lines stripped). It
 opens as unsaved text in the node's editor — so the live graph and the diff animation
-show what it would change — and is refused if the code moved on meanwhile.
+show what it would change — and is refused if the code moved on meanwhile. A rewrite of
+a container lists its changed, added and removed items above the text; clicking one
+undoes just that item (matched by `(kind, name, ordinal)`), the rest stays proposed.
 
 ```sh
 cargo run -p pcg-llm --example summarize -- <dir> <item> [--write-cache]

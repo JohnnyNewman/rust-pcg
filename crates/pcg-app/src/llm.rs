@@ -374,20 +374,20 @@ mod tests {
         let file = g.files.module[0];
         let cache = Mutex::new(SummaryCache::default());
         let plan = summarize::plan(g, &cache.lock().unwrap(), file, false);
-        assert_eq!(plan.len(), 3, "a, m, b (the crate root is the crate node)");
+        assert_eq!(plan.len(), 4, "the crate root (its file), a, m, b");
         let backend = Scripted(|r: &Request| Ok(format!("Does {}.", r.prompt.split('`').nth(1).unwrap())));
         summarize::run(&backend, g, &plan, &cache, 2, &AtomicBool::new(false), &|_| {}).unwrap();
         let c = cache.lock().unwrap();
-        assert_eq!(proposed_in(g, &c, file), 3);
-        assert_eq!(write_summaries(g, &c, file), Ok(3));
+        assert_eq!(proposed_in(g, &c, file), 4);
+        assert_eq!(write_summaries(g, &c, file), Ok(4));
 
         let text = fs::read_to_string(d.join("src/lib.rs")).unwrap();
-        assert!(text.starts_with("/// @pcg:summary["), "{text}");
+        assert!(text.starts_with("//! @pcg:summary["), "the crate root file has its own: {text}");
         assert!(text.contains("\r\n    /// @pcg:summary["), "nested, indented, CRLF: {text}");
         let p2 = crate::load::build(d.clone(), Arc::default(), Default::default(), None, None, Folds::default(), 0);
         let g2 = &p2.graph;
         let fresh = (0..g2.nodes.len()).filter(|&i| g2.nodes.summary_state[i] == SummaryState::Fresh).count();
-        assert_eq!(fresh, 3, "{text}");
+        assert_eq!(fresh, 4, "{text}");
         assert_eq!(proposed_in(g2, &c, NodeId(0)), 0);
     }
 }

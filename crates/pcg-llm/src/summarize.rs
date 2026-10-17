@@ -40,7 +40,7 @@ pub fn known<'a>(g: &'a Graph, cache: &'a SummaryCache, n: NodeId) -> Option<&'a
 
 fn wanted(g: &Graph, n: NodeId) -> bool {
     let i = n.idx();
-    g.nodes.kind[i].is_summarizable() && g.nodes.file[i].is_some() && !g.nodes.bytes[i].is_empty()
+    g.summarizable(n) && !g.nodes.bytes[i].is_empty()
 }
 
 /// Nodes to summarize so that `root` has a summary, as `(node, height)`,
@@ -122,7 +122,7 @@ pub fn request(g: &Graph, cache: &SummaryCache, n: NodeId) -> Result<Request, Er
             p.push_str(&format!("- … and {} more items\n", kids.len() - MAX_ITEMS));
         }
     }
-    if kind == NodeKind::FileModule || kind == NodeKind::InlineModule {
+    if kind.is_module() || kind == NodeKind::Crate {
         p.push_str("\nSummarize the module as a whole.\n");
     }
     Ok(Request { system: SYSTEM.into(), prompt: p, max_tokens: 4096, effort: Effort::Low })

@@ -467,6 +467,14 @@ impl Graph {
         parts.join("::")
     }
 
+    /// `n` may carry `@pcg` comments: an item kind that can, or the module of
+    /// a file — also a crate's root file, whose module is the crate node.
+    pub fn summarizable(&self, n: NodeId) -> bool {
+        let i = n.idx();
+        let f = self.nodes.file[i];
+        f.is_some() && (self.nodes.kind[i].is_summarizable() || self.files.module[f.idx()] == n)
+    }
+
     /// Source text of a node (empty for synthetic nodes).
     pub fn source(&self, n: NodeId) -> &str {
         let f = self.nodes.file[n.idx()];

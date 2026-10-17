@@ -426,7 +426,7 @@ fn inspector(
         }
     }
 
-    if kind.is_summarizable() && g.nodes.file[i].is_some() {
+    if g.summarizable(n) {
         // Filled in with the summary in the code, or a proposed one — and kept
         // following proposals until the user types.
         let proposed = llm.proposed(g, n);
@@ -583,7 +583,7 @@ fn llm_section(
             {
                 *act = Some(Act::Summarize(n, false));
             }
-        } else if g.nodes.kind[i].is_summarizable()
+        } else if g.summarizable(n)
             && ui.button("Summarize again").on_hover_text("Ask for a new summary of this node").clicked()
         {
             *act = Some(Act::Summarize(n, true));
@@ -600,7 +600,7 @@ fn llm_section(
     });
 
     // Intent → code.
-    if g.nodes.kind[i].is_summarizable() && g.nodes.file[i].is_some() {
+    if g.summarizable(n) {
         if st.intent_for != n {
             st.intent_for = n;
             st.intent_draft = if g.nodes.intent[i].is_some() {
